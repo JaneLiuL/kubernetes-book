@@ -478,7 +478,7 @@ type NamespaceInformer interface {
 
 《Kubernetes 源码剖析》第五章
 
-<https://blog.csdn.net/weixin_30722589/article/details/100092473>
+
 
 
 
