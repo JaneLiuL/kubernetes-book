@@ -110,7 +110,7 @@ type EventBroadcaster interface {
 }
 ```
 
-
+### 实例化
 
 EventBroadcaster 通过NewBroadcaster函数进行实例化
 
@@ -121,6 +121,71 @@ func NewBroadcaster() EventBroadcaster {
 		sleepDuration: defaultSleepDuration,
 	}
 ```
+
+
+
+watch.NewBroadcaster： 使用go协程来监控m.incoming，将监控的事件通过loop函数监控incoming的chan, 然后通过distribute分发给所有已经连接的broadcasterWatcher。
+
+```go
+func NewBroadcaster(queueLength int, fullChannelBehavior FullChannelBehavior) *Broadcaster {
+	m := &Broadcaster{
+        // 连接的broadcasterWatcher
+		watchers:            map[int64]*broadcasterWatcher{},
+        // chann, 是存储监控的事件
+		incoming:            make(chan Event, incomingQueueLength),
+		watchQueueLength:    queueLength,
+        // 分发机制，有两种，一种是阻塞型另外一种是非阻塞型
+		fullChannelBehavior: fullChannelBehavior,
+	}
+	m.distributing.Add(1)
+	go m.loop()
+	return m
+}
+
+func (m *Broadcaster) loop() {
+	// Deliberately not catching crashes here. Yes, bring down the process if there's a
+	// bug in watch.Broadcaster.
+	for event := range m.incoming {
+		if event.Type == internalRunFunctionMarker {
+			event.Object.(functionFakeRuntimeObject)()
+			continue
+		}
+        // 通过distribute分发给所有已经连接的broadcasterWatcher
+		m.distribute(event)
+	}
+	m.closeAll()
+	m.distributing.Done()
+}
+
+// 在上面我们已经确定m.watchers就是map[int64]*broadcasterWatcher{}
+// 从下面distribute的代码可以看见，有两种分发方式，一种是非阻塞分发机制，另外一种是阻塞分发机制， 非阻塞分发机制下使用DropIfChannelFull标识，
+func (m *Broadcaster) distribute(event Event) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if m.fullChannelBehavior == DropIfChannelFull {
+		for _, w := range m.watchers {
+			select {
+			case w.result <- event:
+			case <-w.stopped:
+			default: // Don't block if the event can't be queued.
+			}
+		}
+	} else {        
+		for _, w := range m.watchers {
+			select {
+			case w.result <- event:
+			case <-w.stopped:
+			}
+		}
+	}
+}
+```
+
+
+
+注意，从上方的default做非阻塞分发可以看到，如果w.result缓冲区满了，那么event就会丢失。 这个设计是为了保护etcd集群，因为就算Event丢失，也不会影响集群的正常工作，event的重要性远低于集群的稳定性。
+
+在阻塞分发的时候，没有Default关键字，当w.result满的时候，分发过程会阻塞并且等待。
 
 
 
