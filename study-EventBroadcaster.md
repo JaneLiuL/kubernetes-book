@@ -80,36 +80,6 @@ type EventRecorder interface {
 
 Event消费者， 也称事件广播器，EventBroadcaster消费EventRecorder记录的事件，并且将它分发给目前已经连接的broadcasterWatcher。
 
-
-
-```go
-type EventBroadcaster interface {
-	// StartEventWatcher starts sending events received from this EventBroadcaster to the given
-	// event handler function. The return value can be ignored or used to stop recording, if
-	// desired.
-	StartEventWatcher(eventHandler func(*v1.Event)) watch.Interface
-
-	// StartRecordingToSink starts sending events received from this EventBroadcaster to the given
-	// sink. The return value can be ignored or used to stop recording, if desired.
-	StartRecordingToSink(sink EventSink) watch.Interface
-
-	// StartLogging starts sending events received from this EventBroadcaster to the given logging
-	// function. The return value can be ignored or used to stop recording, if desired.
-	StartLogging(logf func(format string, args ...interface{})) watch.Interface
-
-	// StartStructuredLogging starts sending events received from this EventBroadcaster to the structured
-	// logging function. The return value can be ignored or used to stop recording, if desired.
-	StartStructuredLogging(verbosity klog.Level) watch.Interface
-
-	// NewRecorder returns an EventRecorder that can be used to send events to this EventBroadcaster
-	// with the event source set to the given event source.
-	NewRecorder(scheme *runtime.Scheme, source v1.EventSource) EventRecorder
-
-	// Shutdown shuts down the broadcaster
-	Shutdown()
-}
-```
-
 ### 实例化
 
 EventBroadcaster 通过NewBroadcaster函数进行实例化
@@ -117,6 +87,7 @@ EventBroadcaster 通过NewBroadcaster函数进行实例化
 ```go
 func NewBroadcaster() EventBroadcaster {
 	return &eventBroadcasterImpl{
+        // 实例化的时候，就已经传入FullChannelBehavior就是DropIfChannelFull，也就是非阻塞模式
 		Broadcaster:   watch.NewBroadcaster(maxQueuedEvents, watch.DropIfChannelFull),
 		sleepDuration: defaultSleepDuration,
 	}
@@ -191,13 +162,11 @@ func (m *Broadcaster) distribute(event Event) {
 
 ## broadcasterWatcher
 
-观察者管理，用来定义事件的处理方式，例如上报事件到API Server
+观察者管理，用来定义事件的处理方式，例如上报事件到API Server。 每个broadcasterWatcher拥有自定义处理事件的函数：
 
+StartLogging: 把事件写入日志
 
-
-
-
-
+StartRecordingToSink: 将事件上报至API Server并存储到etcd集群中
 
 下面是一段来自statefulset controller的代码
 
@@ -213,5 +182,33 @@ func (m *Broadcaster) distribute(event Event) {
 
 
 
+我们来看看StartRecordingToSink方法
 
+```go
+func (e *eventBroadcasterImpl) StartRecordingToSink(sink EventSink) watch.Interface {
+	eventCorrelator := NewEventCorrelatorWithOptions(e.options)
+	return e.StartEventWatcher(
+		func(event *v1.Event) {
+			recordToSink(sink, event, eventCorrelator, e.sleepDuration)
+		})
+}
+
+func (e *eventBroadcasterImpl) StartEventWatcher(eventHandler func(*v1.Event)) watch.Interface {
+	watcher := e.Watch()
+	go func() {
+		defer utilruntime.HandleCrash()
+        // 不断监控EventBroadcaster 来发现事件并调用eventHandler来处理事件
+		for watchEvent := range watcher.ResultChan() {
+			event, ok := watchEvent.Object.(*v1.Event)
+			if !ok {
+				// This is all local, so there's no reason this should
+				// ever happen.
+				continue
+			}
+			eventHandler(event)
+		}
+	}()
+	return watcher
+}
+```
 
