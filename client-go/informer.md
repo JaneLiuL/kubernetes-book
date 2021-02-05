@@ -1,42 +1,28 @@
-# Overview
+## Overview
 
-这篇文章主要是学习Informer机制并且学习Informer各个组件的设计。
+这篇文章主要是学习Informer机制并且理解Informer各个组件的设计。
 
+## 背景
 
+为什么Kubernetes需要Informer机制？我们知道Kubernetes各个组件都是通过REST API跟API Server交互通信的，而如果每次每一个组件都直接跟API Server交互去读取/写入到后端的etcd的话，会对API Server以及etcd造成非常大的负担。 而Informer机制是为了保证各个组件之间通信的实时性、可靠，并且减缓对API Server和etcd的负担。
 
-# 背景
+## Informer 流程
 
-为什么K8S需要Informer机制？我们知道K8S各个组件都是通过REST API跟API Server交互通信的，而如果每次每一个组件都直接跟API Server交互去读取/写入到后端的etcd的话，会对API Server以及etcd造成非常大的负担。 而Informer机制是为了保证各个组件之间通信的实时性、可靠，并且减缓对API Server和etcd的负担。
-
-# Informer 流程
-
-这个流程，建议先看看《fromcontroollerstudyinformer.md》
-
-这里我们以CoreV1. Pod资源为例子
-
+这里我们以CoreV1. Pod资源为例子：
 1. 第一次启动Informer的时候，Reflector 会使用`List`从API Server主动获取CoreV1. Pod的所有资源对象信息，通过`resync`将资源存放在`Store`中 
-
 2. 持续使用`Reflector`建立长连接，去`Watch` API Server发来的资源变更事件
-
-3. 当2 监控到CoreV1.Pod的资源对象有Add/Modify/Delete之后，就把资源对象存放在`DeltaFIFO`中，
-
+3. 当2 监控到CoreV1.Pod的资源对象有增加删除修改之后，就把资源对象存放在`DeltaFIFO`中，
 4. `DeltaFIFO`是一个先进先出队列，只要这个队列有数据，就被Pop到Controller中, 将这个资源对象存储至`Indexer`中，并且将该资源对象分发至`ShareInformer`
+5. Controller会触发`Process`回调函数
 
-5. Controller会触发`Process`回调函数 
-
-   
-
-
-
-## 打脸
+### 打脸
 
 所以，我自己之前写代码的时候，一直以为是`ShareInformer`去主动watch API Server, 而现在正正打脸了，是`Reflector`做的List&Watch。
 
 
+### ListAndWatch 思考
 
-## ListAndWatch 思考
-
-为什么K8S里面是使用ListAndWathc呢？我们所知道的其他分布式系统常常使用RPC来触发行为。
+为什么Kubernetes里面是使用ListAndWatch呢？我们所知道的其他分布式系统常常使用RPC来触发行为。
 
 我们来分析下如果不这样做，而是采用API Server轮询推送消息给各个组件，或者各个组件轮询去访问API Server的话，那么**实时性**就得不到保证，并且对API Server造成很大的负载，很有可能需要开启大量的端口造成端口浪费。
 
@@ -44,19 +30,13 @@
 
 我们希望是有任何资源的新增/改动/删除，都需要马上获取并且放入消息队列。可以对应我们Informer中的`Reflector`组件，去主动获取消息，并且放入`DeltaFIFO`队列被消费。
 
-
-
 从减轻负载出发的话：
 
-那么这个时候，肯定要上缓存，上缓存的话，这里可以对应我们的`Store`组件。
-
-
+需要上缓存，这里可以对应我们的`Store`组件。
 
 从设计扩展性出发的话：
 
-作为一个“资源管理系统”的K8，我们的对象数量可能会无线扩大，那么我们需要设计一个高效扩展的组件，去应对对象的种类无线扩大，并且同一种对象可能会被用户实例化非常多次的行为。 这里可以对应我们的`Share Informer`。
-
-
+作为一个“资源管理系统”的Kubernetes，我们的对象数量可能会无线扩大，那么我们需要设计一个高效扩展的组件，去应对对象的种类无线扩大，并且同一种对象可能会被用户实例化非常多次的行为。 这里可以对应我们的`Share Informer`。
 
 从消息的可靠性出发的话：
 
@@ -64,15 +44,27 @@
 
 
 
-### Watch的实现
+#### Watch的实现
 
-`Watch`是通过HTTP 长连接接收API Server发送的资源变更事件，使用的`Chunkerd transfer coding`， 源码如下
+`Watch`是通过HTTP 长连接接收API Server发送的资源变更事件，使用的`Chunkerd transfer coding`， 代码位置`./staging/src/k8s.io/apiserver/pkg/endpoints/handlers/watch.go`，源码如下
 
-![1596940870548](C:\Users\EZLIUJA\AppData\Roaming\Typora\typora-user-images\1596940870548.png)
+```go
+    e := streaming.NewEncoder(framer, s.Encoder)
 
-我们通过`curl`来看看, 在`response`的`Header`中设置`Transfer-Encoding`的值是`chunkerd`
+	// ensure the connection times out
+	timeoutCh, cleanup := s.TimeoutFactory.TimeoutCh()
+	defer cleanup()
 
+	// begin the stream
+	w.Header().Set("Content-Type", s.MediaType)
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
 ```
+
+我们使用通过`curl`来看看, 在`response`的`Header`中设置`Transfer-Encoding`的值是`chunkerd`
+
+```bash
 # curl -i http://127.0.0.1:8001/api/v1/watch/namespaces?watch=yes
 HTTP/1.1 200 OK
 Cache-Control: no-cache, private
@@ -85,15 +77,17 @@ Transfer-Encoding: chunked
 
 
 
-# 监听事件： Reflector
+## 监听事件 Reflector
 
-我的理解，Reflector是实现对指定的类型对象的监控，既包括K8S内置资源，也可以是CRD自定义资源。
+我的理解，Reflector是实现对指定的类型对象的监控，既包括Kubernetes内置资源，也可以是CRD自定义资源。
 
-## 数据结构
+
+
+### 数据结构
 
 我们来看看Reflector的数据结构， 代码块`staging/src/k8s.io/client-go/tools/cache/reflector.go`
 
-listerWatcher其实就是从API Server里面去做List跟Watch的操作去获取对象的变更
+listerWatcher其实就是从API Server里面去做List跟Watch的操作去获取对象的变更。
 
 ```go
 type Reflector struct {
@@ -111,9 +105,9 @@ type Reflector struct {
 }
 ```
 
-## Run
+### Run
 
-Run是循环一直把数据存储到`DeltaFIFO`中
+Run是循环一直把数据存储到`DeltaFIFO`中。
 
 ```go
 func (r *Reflector) Run(stopCh <-chan struct{}) {
@@ -128,18 +122,17 @@ func (r *Reflector) Run(stopCh <-chan struct{}) {
 
 也就是说，Reflector是一直在执行ListAndWatch, 除非收到消息stopCh要被关闭，Run才会退出。
 
-## ListAndWatch
 
-书上把这一段讲得很详细了，我贴这段代码，是为了给下面的K8S并发的章节用的，这里用到了`GetResourceVersion` `setLastSyncResourceVersion`等
+
+### ListAndWatch
+
+以下是Kubernetes中ListAndWatch的关键实现代码，ListAndWatch首先回列出所有的对象，并且获取到它们的版本号，然后watch资源对象的版本号更新来判断是否有变更。
 
 ```go
-func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
-	klog.V(3).Infof("Listing and watching %v from %s", r.expectedType, r.name)
+func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {	
 	var resourceVersion string
 
-	// Explicitly set "0" as resource version - it's fine for the List()
-	// to be served from cache and potentially be delayed relative to
-	// etcd contents. Reflector framework will catch up via Watch() eventually.
+    // 首先将资源版本设置为0
 	options := metav1.ListOptions{ResourceVersion: "0"}
 
 	if err := func() error {
@@ -166,25 +159,22 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			panic(r)
 		case <-listCh:
 		}
-		if err != nil {
-			return fmt.Errorf("%s: Failed to list %v: %v", r.name, r.expectedType, err)
-		}
+
 		initTrace.Step("Objects listed")
 		listMetaInterface, err := meta.ListAccessor(list)
-		if err != nil {
-			return fmt.Errorf("%s: Unable to understand list result %#v: %v", r.name, list, err)
-		}
+
 		resourceVersion = listMetaInterface.GetResourceVersion()
 		initTrace.Step("Resource version extracted")
+        // 将list的内容提取成list
 		items, err := meta.ExtractList(list)
-		if err != nil {
-			return fmt.Errorf("%s: Unable to understand list result %#v (%v)", r.name, list, err)
-		}
+
 		initTrace.Step("Objects extracted")
+        // 这个挺关键的，其实是将上方的list的内容和版本号都存到缓存store中
 		if err := r.syncWith(items, resourceVersion); err != nil {
 			return fmt.Errorf("%s: Unable to sync list result: %v", r.name, err)
 		}
 		initTrace.Step("SyncWith done")
+        // 设置最新的资源版本号码
 		r.setLastSyncResourceVersion(resourceVersion)
 		initTrace.Step("Resource version updated")
 		return nil
@@ -209,7 +199,6 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 				return
 			}
 			if r.ShouldResync == nil || r.ShouldResync() {
-				klog.V(4).Infof("%s: forcing resync", r.name)
 				if err := r.store.Resync(); err != nil {
 					resyncerrc <- err
 					return
@@ -220,19 +209,17 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		}
 	}()
 
+    // Watch
 	for {
-		// give the stopCh a chance to stop the loop, even in case of continue statements further down on errors
 		select {
 		case <-stopCh:
 			return nil
 		default:
 		}
-
+	// watch的超时时间
 		timeoutSeconds := int64(minWatchTimeout.Seconds() * (rand.Float64() + 1.0))
 		options = metav1.ListOptions{
 			ResourceVersion: resourceVersion,
-			// We want to avoid situations of hanging watchers. Stop any wachers that do not
-			// receive any events within the timeout window.
 			TimeoutSeconds: &timeoutSeconds,
 		}
 
@@ -240,16 +227,11 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 		if err != nil {
 			switch err {
 			case io.EOF:
-				// watch closed normally
 			case io.ErrUnexpectedEOF:
-				klog.V(1).Infof("%s: Watch for %v closed with unexpected EOF: %v", r.name, r.expectedType, err)
 			default:
 				utilruntime.HandleError(fmt.Errorf("%s: Failed to watch %v: %v", r.name, r.expectedType, err))
 			}
-			// If this is "connection refused" error, it means that most likely apiserver is not responsive.
-			// It doesn't make sense to re-list all objects because most likely we will be able to restart
-			// watch where we ended.
-			// If that's the case wait and resend watch request.
+
 			if urlError, ok := err.(*url.Error); ok {
 				if opError, ok := urlError.Err.(*net.OpError); ok {
 					if errno, ok := opError.Err.(syscall.Errno); ok && errno == syscall.ECONNREFUSED {
@@ -260,7 +242,7 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 			}
 			return nil
 		}
-
+		// watchHandler是通过watch的方式保证当前的资源版本是最新的
 		if err := r.watchHandler(w, &resourceVersion, resyncerrc, stopCh); err != nil {
 			if err != errorStopRequested {
 				klog.Warningf("%s: watch of %v ended with: %v", r.name, r.expectedType, err)
@@ -274,23 +256,23 @@ func (r *Reflector) ListAndWatch(stopCh <-chan struct{}) error {
 
 
 
-### k8S并发
+#### Kubernetes并发
 
-从ListAndWatch的代码，有一段关于`syncWith`的方法，比较重要，原来K8S的并发是通过`ResourceVersion`来实现的，每次对这个对象的改动，都会把改对象的`ResourceVersion`加一
-
-
+从ListAndWatch的代码，有一段关于`syncWith`的方法，比较重要，原来Kubernetes的并发是通过`ResourceVersion`来实现的，每次对这个对象的改动，都会把改对象的`ResourceVersion`加一。
 
 
 
-# 二级缓存： DeltaFIFO & Store
 
-## DeltaFIFO
 
-我们通过数据结构来理解DeltaFIFO，我们先来理解一下Delta
+## 二级缓存DeltaFIFO 和 Store
+
+### DeltaFIFO
+
+我们通过数据结构来理解DeltaFIFO，我们先来理解一下Delta。
 
 代码块`staging/src/k8s.io/client-go/tools/cache/delta_fifo.go`
 
-通过下面的代码块，我们可以非常清晰看得出，`Delta`其实是一个资源对象存储，保存例如Pod的Added操作等。用白话来说其实就是记录K8S每一个对象的变化。
+通过下面的代码块，我们可以非常清晰看得出，`Delta`其实是一个资源对象存储，保存例如Pod的Added操作等。用白话来说其实就是记录Kubernetes每一个对象的变化。
 
 ```go
 type Delta struct {
@@ -321,11 +303,13 @@ type Queue interface {
 }
 ```
 
-结合起来，DeltaFIFO其实就是一个先进先出的K8S对象变化的队列，这个队列中存储不同操作类型的同一个资源对象。
+结合起来，DeltaFIFO其实就是一个先进先出的Kubernetes对象变化的队列，这个队列中存储不同操作类型的同一个资源对象。
 
 DeltaFIFO中的GET方法或者GetByKey都比较简单，接下来对queueActionLocked()函数重点说明。
 
-### queueActionLocked
+
+
+#### queueActionLocked
 
 ```go
 func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) error {
@@ -339,7 +323,7 @@ func (f *DeltaFIFO) queueActionLocked(actionType DeltaType, obj interface{}) err
 	newDeltas := append(f.items[id], Delta{actionType, obj})
     // 合并去重
 	newDeltas = dedupDeltas(newDeltas)
-     // 我一开始理解不了，觉得不可能存在<=0的情况，最新的K8S的代码里面注释说了，正常情况下不会出现<=0， 加这个判断属于冗余判断
+     // 我一开始理解不了，觉得不可能存在<=0的情况，最新的Kubernetes的代码里面注释说了，正常情况下不会出现<=0， 加这个判断属于冗余判断
 	if len(newDeltas) > 0 {
 		if _, exists := f.items[id]; !exists {
 			f.queue = append(f.queue, id)
@@ -383,15 +367,13 @@ func isDup(a, b *Delta) *Delta {
 
 
 
-
-
 之前群里有人问为什么dedupDeltas只是去这个列表的倒数一个跟倒数第二个去进行合并去重的操作，这里说明一下，dedupDeltas是被queueActionLocked函数调用的，而queueActionLocked为什么我们拿出来讲，是因为在Delete/Update/Add里面去调用了queueActionLocked，合并是对某一个obj的一系列操作，而去重是只针对delete。
 
 我们可以拿一个例子来看看，假设是[obj1]: [add: delta1, update: delta2, delete: delta3,  delete: delta3] 在经过queueActionLocked之后会变成[obj1]: [add: delta1, update: delta2, delete: delta3] 
 
 
 
-### 消费者方法
+#### 消费者方法
 
 ```go
 func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
@@ -438,19 +420,19 @@ func (f *DeltaFIFO) Pop(process PopProcessFunc) (interface{}, error) {
 
 
 
-## LocalStore
+#### LocalStore
 
 缓存机制，但LocalStore是被`Lister`的`List/Get`方法访问
 
 
 
-# Share Informer 共享机制
+## Share Informer 共享机制
 
 从流程上我们说了，因为是`DeltaFIFO`把消息分发至`Share Informer`中，因此我们可以用`Inforomer`添加自定义的回调函数，也就是我们经常看到的`OnAdd`  `OnUpdaate`和`OnDelete`
 
 
 
-K8S内部的每一个资源都实现了Informer机制，如下是一个Namespace的Informer的例子
+Kubernetes内部的每一个资源都实现了Informer机制，如下是一个Namespace的Informer的例子
 
 代码块`staging/src/k8s.io/client-go/informers/core/v1/namespace.go`
 
@@ -464,21 +446,41 @@ type NamespaceInformer interface {
 
 
 
-# Indexer
+## Indexer
 
-说人话，Indexer也是一个存储来的，不一样的是，Indexer除了存储之外，还有索引的功能。
+以下是Indexer的数据结构，清晰的看见Indexer继承了Store接口， 还增加了索引的功能。
+
+```go
+type Indexer interface {
+	Store
+	Index(indexName string, obj interface{}) ([]interface{}, error)
+...
+}
+
+```
 
 看看我们流程第四个步骤： `DeltaFIFO`是一个先进先出队列，只要这个队列有数据，就被Pop到Controller中, 将这个资源对象存储至`Indexer`中。 这个步骤说明了Indexer存储的数据来源。
 
 
 
+我们看看Indexer关键的几个索引函数
 
+```go
+// 索引函数，传入的是对象，返回的是检索结果的列表，例如我们可以通过IndexFunc去查某个Annotation/label的configmap
+type IndexFunc func(obj interface{}) ([]string, error)
+// 索引函数，key是索引器名词，value是索引器的实现函数
+type Indexers map[string]IndexFunc
+ // 索引函数name   对应多个索引键   多个对象键   真正对象 
+type Indices map[string]Index            
+// 索引缓存，map类型                     
+type Index map[string]sets.String 
+```
 
-# Reference
+总结一下：
 
-《Kubernetes 源码剖析》第五章
+Indexers: 索引函数name --> 索引实现函数-->索引key值
+Indics: 索引函数name --> 对应多个索引key值 --> 每个索引key值对应不同的资源
 
-
-
+举个例子来说明的话：对象Pod有一个标签app=version1，这里标签就是索引键，Indexer会把相同标签的所有Pod放在一个集合里面，然后我们实现对标签分类就是我们Indexer的核心内容。
 
 
