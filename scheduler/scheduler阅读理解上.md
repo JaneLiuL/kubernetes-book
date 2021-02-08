@@ -31,7 +31,7 @@ Kubernetes 的调度器的一个总的调度流程：
 5. 选出最高分的节点Node，**异步**进行**绑定**Volume，如果绑定环节失败，那么将解绑Node节点以及资源。
 6. 如果在4或者5失败，也就是无法选出符合Pod对象的Node，那么进入抢占环节，挤兑低优先级的Pod对象去抢占Node节点。
 
-![](../images/scheduler-flow.png)
+![](./images/scheduler-flow.png)
 
 
 
@@ -41,11 +41,11 @@ Kubernetes 的调度器的一个总的调度流程：
 
 调度框架通过插件的机制去接受插件的结果，根据插件结果去继续下一个步骤或者停止调度，这种机制允许我们处理错误并且也可以与插件通信。
 
-![](../images/scheduler-plugins.png)
+![](./images/scheduler-plugins.png)
 
 从下图可以看出，Scheduler framework实现了两个阶段：调度周期和绑定周期。绿色所在箭头，Scheduler framework都提供了扩展接口供用户扩展调度需求。 接下来，我们会跟着一个Pod被调度的流程概述，详细分析在每一个阶段里面调度器的操作。
 
-![](../images/schedule-extend.png)
+![](./images/schedule-extend.png)
 
 ## Step1: 新增Pod
 
@@ -203,7 +203,7 @@ func (g *genericScheduler) findNodesThatPassFilters(...) {
 
 在打分环节完成之后会返回NodeScoreList的列表，调度器会`selectHost`方法从返回结果中为Pod对象绑定一个Node节点。
 
-![](../images/scheduler-score.png)
+![](./images/scheduler-score.png)
 
 
 
