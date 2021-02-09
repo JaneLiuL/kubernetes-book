@@ -198,7 +198,33 @@ func (a *attacher) Attach(ctx context.Context, volumeID string, readOnly bool, n
 
 # 部署CSI 驱动
 
+CSI驱动程序通常作为两个组件部署在Kubernetes中: 一个controller plugin和per-node plugin。
+
+## Controller 插件
+
+controller组件可以作为Deployment或StatefulSet部署在集群中的任何节点上。它由实现CSI控制器服务的CSI驱动程序和一个或多个sidecar容器组成。这些控制器sidecar容器通常与Kubernetes对象交互，并调用驱动程序的CSI控制器服务。
+
+它通常不需要直接访问主机，可以通过Kubernetes API和外部控制平面服务执行所有操作。可以为HA部署controller组件的多个副本，但是建议使用leader选举，以确保一次只有一个活动控制器。
+
+controller sidecar包括external-provisioner, external-attacher, external-snapshotter, and external-resizer。在部署中包括一个sidecar可能是可选的
+
+## Node 插件
+
+Node插件需要以DaemonSet来给每一个node节点部署。
+
+如下图所示，Kubernetes kubelet运行在每个节点上，负责进行CSI节点服务调用。这些调用从存储系统挂载和卸载存储卷，使Pod可以使用它。**Kubelet通过主机上通过HostPath卷共享的UNIX socket调用CSI驱动程序**。还有第二个UNIX socket， node-driver-registrar 使用它将CSI驱动程序注册到kubelet。
+
+这里建议读者阅读kubelet/pluginmanager.md理解Kubelet是如何发现并且注册CSI插件。
+
+![](./images/node-plugin.png)
+
 # 如何测试驱动
+
+## 单元测试
+
+
+
+## 功能测试
 
 # 如何编写一个本地存储CSI 
 

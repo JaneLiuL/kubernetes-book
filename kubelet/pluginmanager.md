@@ -8,7 +8,9 @@ PluginManager是Kubelet的插件注册服务，代码位置位于`pkg/kubelet/pl
 
 代码位置：`pkg/kubelet/pluginmanager/pluginwatcher/plugin_wtcher.go`
 
-当他们把一个socket放在那个目录中时，或者在Kubelet启动时，如果套接字已经在那里，pluginwatcher服务将发现PluginDir中的插件。同样，如果socket文件从目录里面移除，那么pluginwatcher会从从kubelet移除该插件
+当他们把一个socket放在那个目录中时，或者在Kubelet启动时，如果套接字已经在那里，pluginwatcher服务将发现PluginDir中的插件。同样，如果socket文件从目录里面移除，那么pluginwatcher会从从kubelet移除该插件。
+
+我们以CSI驱动来举例子，Kubelet需要通过Unix Socket跟外部的CSI驱动沟通，CSI volume启动会在每一个Node节点的`/var/lib/kubelet/plugins/[CSIDriverName]/csi.sock`创建一个socket（CSIDriverName就是该插件的名字）。我们的PluginManager会监控这个目录，一旦有新文件创建，那么就把该插件注册。
 
 ```go
 func (w *Watcher) Start(stopCh <-chan struct{}) error {
@@ -115,5 +117,7 @@ func (w *Watcher) handlePluginRegistration(socketPath string) error {
 1. 登记。针对套接字调用GetInfo。
 
 2. DeRegisterPlugin是针对内部插件类型处理程序调用的。
+
+我们
 
 # 接口
