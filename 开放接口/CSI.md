@@ -12,6 +12,10 @@ CSI是作为一个标准开发的，用于将任意块和文件存储存储系�
 
 跟CRI类似，CSI也是定义了gRPC接口，云厂商的存储插件需要实现以下接口。
 
+## Identity接口
+
+该接口主要是用来获取插件信息，查询插件状态
+
 ```protobuf
 service Identity {
   // 返回插件信息
@@ -24,7 +28,15 @@ service Identity {
   rpc Probe (ProbeRequest)
     returns (ProbeResponse) {}
 }
+```
 
+
+
+## Controller接口
+
+从存储服务端来进行操作卷，包括创建卷，删除卷等
+
+```protobuf
 service Controller {
   // 创建卷
   rpc CreateVolume (CreateVolumeRequest)
@@ -40,7 +52,13 @@ service Controller {
     returns (ControllerUnpublishVolumeResponse) {}
  ...
 }
+```
 
+## Node接口
+
+对Node节点上的卷进行操作
+
+```protobuf
 service Node {
  // 格式化卷并且挂载到一个临时目录
   rpc NodeStageVolume (NodeStageVolumeRequest)
@@ -61,13 +79,86 @@ service Node {
 
 
 
+# 背景知识
+
+这篇文章由于很多地方涉及到卷的操作：Attach, Detach, Mount和Unmount，一般来说，卷都需要Attach--> Mount-->Unmount--> Detach这四个操作，只有EmptyDir跟HostPath这两种才不需要Attach和Detach操作。
+
+## 卷的生命周期
+
+当用户创建卷的时候，首先调用CreateVolume接口，去创建卷，然后调用ControllerPublishVolume将卷attch到主机上，接下来会调用NodeStageVolume来进行格式化最后调用NodeStageVolume来mount到指定目录下。
+
+CreateVolume-->ControllerPublishVolume-->NodeStageVolume-->NodePublishVolume
+
 # Sidecar容器
+
+Kubernetes CSI Sidecar容器是一组标准容器，旨在简化在Kubernetes上CSI驱动程序的开发和部署。
+
+这些容器包含公共逻辑，用于监视Kubernetes API，触发针对“CSI卷驱动程序”容器的适当操作，并适当地更新Kubernetes API。
+
+这些容器打算与第三方CSI驱动程序容器捆绑在一起，并作为pod部署在一起。
 
 一般来说，CSI驱动程序应该和以下sidecar (helper)容器一起部署在Kubernetes上:
 
 ## external-attacher
 
-监视Kubernetes VolumeAttachment对象，并触发针对CSI端点ControllerPublish和ControllerPublish操作
+监视由controller-manager创建的VolumeAttachment对象，并将卷附加/卸载到/从节点上(即调用ControllerPublish/ controllererunpublish)。
+
+(ControllerPublish是让一个node节点不需要运行任何代码就可以attach卷)
+
+(Detach就是反向操作，从一个node节点中detach卷)
+
+代码库： https://github.com/kubernetes-csi/external-attacher.git
+
+```go
+func NewCSIAttachController(client kubernetes.Interface, attacherName string, handler Handler, volumeAttachmentInformer storageinformers.VolumeAttachmentInformer, pvInformer coreinformers.PersistentVolumeInformer, vaRateLimiter, paRateLimiter workqueue.RateLimiter, shouldReconcileVolumeAttachment bool, reconcileSync time.Duration) *CSIAttachController {
+	...
+	ctrl := &CSIAttachController{
+		client:                          client,
+		attacherName:                    attacherName,
+		handler:                         handler,
+		eventRecorder:                   eventRecorder,
+		vaQueue:                         workqueue.NewNamedRateLimitingQueue(vaRateLimiter, "csi-attacher-va"),
+		pvQueue:                         workqueue.NewNamedRateLimitingQueue(paRateLimiter, "csi-attacher-pv"),
+		shouldReconcileVolumeAttachment: shouldReconcileVolumeAttachment,
+		reconcileSync:                   reconcileSync,
+	}
+    // 监听volumeAttachment的增删改，触发写入队列
+	volumeAttachmentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    ctrl.vaAdded,
+		UpdateFunc: ctrl.vaUpdated,
+		DeleteFunc: ctrl.vaDeleted,
+	})
+	...
+	pvInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    ctrl.pvAdded,
+		UpdateFunc: ctrl.pvUpdated,
+		//DeleteFunc: ctrl.pvDeleted, TODO: do we need this?
+	})
+...
+	return ctrl
+}
+
+```
+
+然后执行ControllerPublishVolume
+
+```go
+func (a *attacher) Attach(ctx context.Context, volumeID string, readOnly bool, nodeID string, caps *csi.VolumeCapability, context, secrets map[string]string) (metadata map[string]string, detached bool, err error) {
+	client := csi.NewControllerClient(a.conn)
+	req := csi.ControllerPublishVolumeRequest{
+		VolumeId:         volumeID,
+		NodeId:           nodeID,
+		VolumeCapability: caps,
+		Readonly:         readOnly,
+		VolumeContext:    context,
+		Secrets:          secrets,
+	}    
+	rsp, err := client.ControllerPublishVolume(ctx, &req)
+	...
+	return rsp.PublishContext, false, nil
+}
+
+```
 
 
 
@@ -75,9 +166,23 @@ service Node {
 
 监视Kubernetes PersistentVolumeClaim对象，并针对CSI端点触CreateVolume和DeleteVolume操作。
 
+例如当我们创建一个`PersistentVolumeClaim`对象的时候，如果PVC指定了一个特定的`StorageClass`，并且存储类的provisioner字段中的名称与GetPluginInfo调用中指定的CSI端点返回的名称相匹配，则通过创建新的Kubernetes PersistentVolumeClaim对象触发卷供应。
+
+成功地配给新卷之后，sidecar容器创建一个Kubernetes PersistentVolume对象来表示卷。
+
+使用删除回收策略删除绑定到与此驱动程序对应的`PersistentVolumeClaim`对象，将导致sidecar容器对指定的CSI端点触发DeleteVolume操作以删除卷。成功删除卷之后，sidecar容器还删除表示卷的PersistentVolume对象。
+
+代码库：https://github.com/kubernetes-csi/external-provisioner.git
+
+
+
+
+
 ## node-driver-registrar
 
 使用kubelet设备插件机制向kubelet注册CSI驱动程序。
+
+
 
 ## cluster-driver-registrar
 

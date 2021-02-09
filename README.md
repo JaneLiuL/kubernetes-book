@@ -30,6 +30,8 @@
 
 第四章. Kubelet
 
+  \- 4.1. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
+
 第五章. 开放接口
 
   \- 4.1.  [容器运行时CRI](/开放接口/CRI.md)
