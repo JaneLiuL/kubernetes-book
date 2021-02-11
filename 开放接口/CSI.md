@@ -222,11 +222,19 @@ Node插件需要以DaemonSet来给每一个node节点部署。
 
 ## 单元测试
 
+使用CSI sanity的包可以用来测试CSI驱动。
+
+https://github.com/kubernetes-csi/csi-test/tree/master/pkg/sanity
+
+
+
 
 
 ## 功能测试
 
-# 如何编写一个本地存储CSI 
+这里说的功能测试，是在功能上进行“端到端”测试。
+
+# 
 
 
 
