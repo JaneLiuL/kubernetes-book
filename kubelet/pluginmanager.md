@@ -118,6 +118,57 @@ func (w *Watcher) handlePluginRegistration(socketPath string) error {
 
 2. DeRegisterPlugin是针对内部插件类型处理程序调用的。
 
-我们
 
-# 接口
+
+
+
+## 插件注册的单元测试
+
+注册插件的单元测试，代码位置在：`pkg/kubelet/pluginmanager/pluginwatcher/plugin_wtcher_test.go`
+
+```go
+func TestPluginRegistration(t *testing.T) {
+    // 最后清理测试插件
+	defer cleanup(t)
+
+    // 获取DesiredStateOfWorld的instance数量
+	dsw := cache.NewDesiredStateOfWorld()
+    // 开启监控，不断获取desiredStateOfWorld的数量
+	newWatcher(t, dsw, wait.NeverStop)
+
+	for i := 0; i < 10; i++ {
+        // socketDir在单元测试的init函数已经确定，就是当前目录的plugin_test目录下，也就是socketPath是./plugin_test/plugin-[1-10].sock目录
+		socketPath := fmt.Sprintf("%s/plugin-%d.sock", socketDir, i)
+        // 插件名字example-plugin-[1-10]
+		pluginName := fmt.Sprintf("example-plugin-%d", i)
+        // 实例化一个ExamplePlugin
+		p := NewTestExamplePlugin(pluginName, registerapi.DevicePlugin, socketPath, supportedVersions...)
+		require.NoError(t, p.Serve("v1beta1", "v1beta2"))
+		// 调用GetInfo登记插件信息
+		pluginInfo := GetPluginInfo(p)
+        // 注册插件信息
+		waitForRegistration(t, pluginInfo.SocketPath, dsw)
+
+		// 检查插件的desired state
+		dswPlugins := dsw.GetPluginsToRegister()
+		if len(dswPlugins) != 1 {
+			t.Fatalf("TestPluginRegistration: desired state of world length should be 1 but it's %d", len(dswPlugins))
+		}
+
+        // 停止插件，并且把desire state of world cache清理
+		require.NoError(t, p.Stop())
+		waitForUnregistration(t, pluginInfo.SocketPath, dsw)
+		dswPlugins = dsw.GetPluginsToRegister()
+		if len(dswPlugins) != 0 {
+			t.Fatalf("TestPluginRegistration: desired state of world length should be 0 but it's %d", len(dswPlugins))
+		}
+	}
+}
+```
+
+
+
+
+
+
+

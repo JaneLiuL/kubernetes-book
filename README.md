@@ -26,11 +26,13 @@
 
 第三章. Scheduler
 
-  \- 3.1. 
+  \- 3.1. [scheluler overall](/scheduler/scheduler阅读理解上.md)
 
 第四章. Kubelet
 
-  \- 4.1. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
+  \- 4.1. [Kubelet架构](/kubelet/kubelet架构.md)
+
+  \- 4.2. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
 
 第五章. 开放接口
 
