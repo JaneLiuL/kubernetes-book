@@ -32,7 +32,7 @@
 
   \- 4.1. [Kubelet架构](/kubelet/kubelet架构.md)
 
-  \- 4.2. [Kubelet增删改Pod流程.md](/kubelet/kubelet增删改Pod流程.md.md)
+  \- 4.2. [Kubelet增删改Pod流程.md](/kubelet/kubelet增删改Pod流程.md)
 
   \- 4.2. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
 
