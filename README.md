@@ -32,9 +32,11 @@
 
   \- 4.1. [Kubelet架构](/kubelet/kubelet架构.md)
 
-  \- 4.2. [Kubelet增删改Pod流程.md](/kubelet/kubelet增删改Pod流程.md)
+  \- 4.2. [Kubelet增删改Pod流程](/kubelet/kubelet增删改Pod流程.md)
 
-  \- 4.2. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
+  \- 4.3. [Kubelet pleg模块](/kubelet/kubelet_pleg模块.md)
+
+  \- 4.4. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
 
 第五章. 开放接口
 
