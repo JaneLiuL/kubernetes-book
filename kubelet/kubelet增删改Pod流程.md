@@ -490,14 +490,11 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		if isInBackOff {
 			startContainerResult.Fail(err, msg)			
 			return err
-		}
-
-		klog.V(4).Infof("Creating %v %+v in pod %v", typeName, container, format.Pod(pod))
-		// NOTE (aramase) podIPs are populated for single stack and dual stack clusters. Send only podIPs.
+		}				
+        // 启动容器，具体可见附: 启动容器
 		if msg, err := m.startContainer(podSandboxID, podSandboxConfig, container, pod, podStatus, pullSecrets, podIP, podIPs); err != nil {
 			startContainerResult.Fail(err, msg)
-			// known errors that are logged in other places are logged at higher levels here to avoid
-			// repetitive log spam
+			...
 			switch {
 			case err == images.ErrImagePullBackOff:
 				klog.V(3).Infof("%v start failed: %v: %s", typeName, err, msg)
@@ -510,29 +507,22 @@ func (m *kubeGenericRuntimeManager) SyncPod(pod *v1.Pod, podStatus *kubecontaine
 		return nil
 	}
 
-	// Step 5: start ephemeral containers
-	// These are started "prior" to init containers to allow running ephemeral containers even when there
-	// are errors starting an init container. In practice init containers will start first since ephemeral
-	// containers cannot be specified on pod creation.
+    // 创建临时容器
 	if utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
 		for _, idx := range podContainerChanges.EphemeralContainersToStart {
 			c := (*v1.Container)(&pod.Spec.EphemeralContainers[idx].EphemeralContainerCommon)
 			start("ephemeral container", c)
 		}
 	}
-
-	// Step 6: start the init container.
-	if container := podContainerChanges.NextInitContainerToStart; container != nil {
-		// Start the next init container.
+	
+    // 启动init 容器
+	if container := podContainerChanges.NextInitContainerToStart; container != nil {		
 		if err := start("init container", container); err != nil {
 			return
 		}
 
-		// Successfully started the container; clear the entry in the failure
-		klog.V(4).Infof("Completed init container %q for pod %q", container.Name, format.Pod(pod))
-	}
 
-	// Step 7: start containers in podContainerChanges.ContainersToStart.
+    // 启动容器里面需要启动的容器
 	for _, idx := range podContainerChanges.ContainersToStart {
 		start("container", &pod.Spec.Containers[idx])
 	}
@@ -581,6 +571,100 @@ func (m *kubeGenericRuntimeManager) createPodSandbox(pod *v1.Pod, attempt uint32
 
 	return podSandBoxID, "", nil
 }
+```
+
+
+
+### 附：启动容器
+
+步骤如下：
+
+1. 拉取镜像
+2. 调用容器运行时去创建容器
+3. 记录容器启动次数
+4. 执行PostStart hook
+
+```go
+func (m *kubeGenericRuntimeManager) startContainer(podSandboxID string, podSandboxConfig *runtimeapi.PodSandboxConfig, container *v1.Container, pod *v1.Pod, podStatus *kubecontainer.PodStatus, pullSecrets []v1.Secret, podIP string, podIPs []string) (string, error) {
+	// 拉取镜像
+	imageRef, msg, err := m.imagePuller.EnsureImageExists(pod, container, pullSecrets, podSandboxConfig)
+	if err != nil {
+		...
+	}
+
+	// 创建容器
+	ref, err := kubecontainer.GenerateContainerRef(pod, container)
+	if err != nil {
+		...
+	}
+	
+    // restartCount 是记录容器被启动的次数，第一次创建的容器 restartCount 是0
+	restartCount := 0
+	containerStatus := podStatus.FindContainerStatusByName(container.Name)
+	if containerStatus != nil {
+		restartCount = containerStatus.RestartCount + 1
+	}
+
+	containerConfig, cleanupAction, err := m.generateContainerConfig(container, pod, restartCount, podIP, imageRef, podIPs)
+	if cleanupAction != nil {
+		defer cleanupAction()
+	}
+	if err != nil {
+		...
+	} 
+    // 调用容器运行时创建容器CreateContainer
+	containerID, err := m.runtimeService.CreateContainer(podSandboxID, containerConfig, podSandboxConfig)
+	if err != nil {
+		...
+	}
+    // PreStartContainer是属于InternalContainerLifecycle接口下的方法之一，主要作用是在容器启动之前进行类似设备挂载，设置endpoint
+	err = m.internalLifecycle.PreStartContainer(pod, container, containerID)
+	if err != nil {
+		....
+	}
+
+	if ref != nil {
+		m.containerRefManager.SetRef(kubecontainer.ContainerID{
+			Type: m.runtimeName,
+			ID:   containerID,
+		}, ref)
+	}
+
+	// 启动容器，同样也是调用CRI的StartContainer
+	err = m.runtimeService.StartContainer(containerID)
+	if err != nil {
+		...
+	}
+	
+
+	// 将容器日志链接到用于集群日志记录的遗留容器日志位置
+	containerMeta := containerConfig.GetMetadata()
+	sandboxMeta := podSandboxConfig.GetMetadata()
+	legacySymlink := legacyLogSymlink(containerID, containerMeta.Name, sandboxMeta.Name,
+		sandboxMeta.Namespace)
+	containerLog := filepath.Join(podSandboxConfig.LogDirectory, containerConfig.LogPath)
+
+	if _, err := m.osInterface.Stat(containerLog); !os.IsNotExist(err) {
+		if err := m.osInterface.Symlink(containerLog, legacySymlink); err != nil {
+			...
+		}
+	}
+	
+    // 执行PostStart hook
+	if container.Lifecycle != nil && container.Lifecycle.PostStart != nil {
+		kubeContainerID := kubecontainer.ContainerID{
+			Type: m.runtimeName,
+			ID:   containerID,
+		}
+		msg, handlerErr := m.runner.Run(kubeContainerID, pod, container, container.Lifecycle.PostStart)
+		if handlerErr != nil {
+			...
+		}
+	}
+
+	return "", nil
+}
+
 ```
 
 
