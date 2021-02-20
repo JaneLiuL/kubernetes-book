@@ -8,6 +8,8 @@
 
 ```bash
 make test WHAT=./pkg/kubelet 
+# 也可以使用go test
+go test ./pkg/kubelet
 ```
 
 ![](./images/kubelet_ut.png)
@@ -18,6 +20,8 @@ make test WHAT=./pkg/kubelet
 
 ```bash
 make test WHAT=./pkg/kubelet/..
+# 也可以使用go test
+go test ./pkg/kubelet/...
 ```
 
 
@@ -30,7 +34,7 @@ make test WHAT=./pkg/kubelet KUBE_COVER=y
 
 
 
-只运行某个单元测试函数
+只运行某个单元测试函数, 也可以使用`go test ./pkg/kubelet -v -run TestSyncPodsDeletesWhenSourcesAreReady`
 
 ```bash
 make test WHAT=./pkg/kubelet GOFLAGS="-v" KUBE_TEST_ARGS='-run TestSyncPodsDeletesWhenSourcesAreReady'
@@ -57,10 +61,10 @@ make test WHAT=./pkg/kubelet  PARALLEL=3 ITERATION=6
 
 
 
+# 集成测试
 
 
 
 
 
-
-# 功能测试
+# 端到端测试

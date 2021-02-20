@@ -36,7 +36,15 @@
 
   \- 4.3. [Kubelet pleg模块](/kubelet/kubelet_pleg模块.md)
 
-  \- 4.4. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
+  \- 4.5. [Kubelet nodestatus模块](/kubelet/kubelet_nodestatus模块.md)
+
+  \- 4.4. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
+
+plan: volumeMnager模块
+
+plan: probeMnager模块
+
+  \- 4.5. [插件注册服务PluginManager](/kubelet/pluginmanager.md)
 
 第五章. 开放接口
 

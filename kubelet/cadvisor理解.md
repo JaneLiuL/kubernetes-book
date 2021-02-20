@@ -1,4 +1,40 @@
+# Overview
 
+`cAdvisor`是谷歌开发的容器监控工具，可以对机器以及容器进行实时监控和数据采集，包括CPU、内存、文件系统等情况，cAdvisor是集成在`Kubelet` 每台worker node节点上都会自行启动`cAdvisor`, 主要代码位于`./pkg/kubelet/cadvisor`目录下。
+
+# 接口
+
+cadvisor调用的cadvisor方法有以下几种，像`ContainerInfo`，`SubcontainerInfo`和`MachineInfo`这些都是cadvisor本身已经提供的方法，`Kubelet`无需再实现或者简单封装，而`WatchEvents`这些
+
+```go
+type Interface interface {
+	Start() error    
+	DockerContainer(...)
+	ContainerInfo(..)
+	ContainerInfoV2(...)
+	SubcontainerInfo(...)
+	MachineInfo() (...)
+	VersionInfo() (...)
+	// 返回image信息
+	ImagesFsInfo() (cadvisorapiv2.FsInfo, error)
+	// 返回根的文件系统信息
+	RootFsInfo() (cadvisorapiv2.FsInfo, error)
+	// 从channel里面获取event信息
+	WatchEvents(request *events.Request) (*events.EventChannel, error)
+	//获取指定目录的文件系统信息 
+	GetDirFsInfo(path string) (cadvisorapiv2.FsInfo, error)
+}
+```
+
+那么`Kubelet`在什么时候如何使用这些接口呢？
+
+`Kubelet` 在自身启动运行的时候获取机器信息，以及OOM模块中使用了`cAdvisor`去监听OOM事件
+
+
+
+
+
+# OOM
 
 OOM 是out of memory的意思，是Kubernetes使用google的cadvisor监控container的资源使用情况，一旦container out of memory， 则使用client-go的record把事件记录。
 
@@ -52,3 +88,8 @@ docker run \
 --privileged=true \
 google/cadvisor:latest
 ```
+
+
+
+
+
