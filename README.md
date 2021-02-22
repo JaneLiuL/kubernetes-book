@@ -36,9 +36,11 @@
 
   \- 4.3. [Kubelet pleg模块](/kubelet/kubelet_pleg模块.md)
 
-  \- 4.5. [Kubelet nodestatus模块](/kubelet/kubelet_nodestatus模块.md)
+  \- 4.4. [Kubelet nodestatus更新节点状态模块](/kubelet/kubelet_nodestatus模块.md)
 
-  \- 4.4. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
+  \- 4.5. [Kubelet eviction驱逐模块](/kubelet/kubelet_eviction驱逐模块.md)
+
+  \- 4.6. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
 
 plan: volumeMnager模块
 
