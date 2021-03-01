@@ -1,26 +1,36 @@
 # 问题
 
-当我们尝试使用PVC和Deployment的时候，我们发现，当我们这个Deployment需要挂载PVC的时候，出现了一个问题，Deployment的Pod被调度到节点A, 而节点A是属于zone 1的，PVC的磁盘却是zone 2，导致无法绑定该PVC。
+架构师询问：我们尝试使用PVC和Deployment的时候，当我们这个Deployment需要挂载PVC的时候，是否出现了一个问题，Deployment的Pod被调度到节点A, 而节点A是属于zone 1的，PVC的磁盘却是zone 2，导致无法绑定该PVC？
 
-
+这篇文章是基于Kubernetes的master  commitid:  8e8b6a01cf6bf55dea5e2e4f554597a95c82988a写下的源码分析文档。
 
 # 问题是如何引起的
 
-我们需要每一次部署Deployment的时候，都能正确绑定的PVC是同属于一个zone的。而PVC是在我们kubectl apply pvc.yaml的时候已经创建完成，调度器看起来没有感知到卷的位置，把Deployment调度去了另外一个zone的节点。猜测问题应该出在调度器上。
+我们需要每一次部署Deployment的时候，都能正确绑定的PVC是同属于一个zone的。而PVC是在我们kubectl apply pvc.yaml的时候已经创建完成，调度器看起来没有感知到卷的位置，把Deployment调度去了另外一个zone的节点。如果真的出现这个问题的话，猜测问题应该出在调度器上。
 
 ## 调度器过程
 
-
+调度器overall过程可以看[scheluler overall](/scheduler/scheduler阅读理解上.md)。 而决定一个node节点是否能满足Pod的需求的很重要的阶段是**过滤**。
 
 
 
 ### 过滤
 
+对调度器来说，如何调用每一个enable插件在过滤阶段的过滤方法，调用链如下，也就是说在调度器过滤的阶段，每个支持过滤阶段执行的调度器插件都会被执行`Filter`方法， 
 
+```bash
+RunFilterPlugins()
+	 f.runFilterPlugin(ctx, pl, state, pod, nodeInfo)
+	 	pl.Filter(ctx, state, pod, nodeInfo)
+```
+
+
+
+而涉及到PVC和PV的调度器插件是`VolumeBinding`和`volumezone`，接下来我们会先看看`volumebinding `插件。
 
 #### volumebinding 插件
 
-在调度器过滤的阶段，每个支持过滤阶段执行的调度器插件都会被执行`Filter`方法， 涉及到PVC和PV的调度器插件是`VolumeBinding`
+`volumebinding`插件只参与了调度器的过滤环节，而`volumebinding`的`Filter`方法是调用了`predicate`方法。
 
 ```go
 // 代码位置 pkg/scheduler/framework/plugins/volumebinding/volume_binding.go
@@ -30,10 +40,10 @@ func (pl *VolumeBinding) Filter(ctx context.Context, cs *framework.CycleState, p
 }
 ```
 
-`volumebinding`  是一个在调度器过滤阶段检查节点是否满足Pod的Volume绑定的方法，  如果满足的话函数返回的`true`和`nil`, `nil`,  如果不满足，那么返回`false`，以及不满足的原因和错误。 插件的工作流程如下：
+`volumebinding`  插件的`predicate`方法是一个在调度器过滤阶段检查节点是否满足Pod的Volume绑定，  如果满足的话函数返回的`true`和`nil`, `nil`,  如果不满足，那么返回`false`，以及不满足的原因和错误。 插件的工作流程如下：
 
 1. 如果pod没有PVC，就直接返回
-2. 调用FindPodVolumes 检查节点是否满足pod的PVC要求。具体检查算法跟PVC Controller使用了同一个算法，只判断大小大于等于PVC大小的PV，并且access mode一致，并不检查disk zone。
+2. 调用`FindPodVolumes` 检查节点是否满足pod的PVC要求。具体检查算法跟PVC Controller使用了同一个算法，只判断大小大于等于PVC大小的PV，并且access mode一致，并不检查disk zone。
 
 ```go
 // 代码位置 pkg/scheduler/algorithm/predicates/predicates.go
@@ -168,23 +178,46 @@ func (b *volumeBinder) FindPodVolumes(pod *v1.Pod, node *v1.Node) (unboundVolume
 
 
 
-#### volume_zone插件
+#### volumezone插件
+
+`volumezone`插件只参与了调度器的过滤环节。
+
+过滤环节会返回三个参数：
+
+1. 是否满足pod的需求，是返回true
+2. 不满足的原因
+3. 错误
+
+工作流程如下：
+
+1. 如果pod不需要volumes，直接返回满足过滤条件true，不再做其他检查
+2. 轮询node节点的所有label， 获取key是`"failure-domain.beta.kubernetes.io/zone"`  和key是`"failure-domain.beta.kubernetes.io/region"` 的label， 添加到`nodeConstraints` map中
+3. 如果`nodeConstraints`长度是空，也就是说明这个node节点没有约束，可以直接被调度。 也就是说，当我们使用zone的时候，所有的node节点都需要打上zone的label
+4. 检查PVC是否存在, 如果PVC设置了延迟绑定，那么跳过该PVC
+5. 获取PV的label，获取key是`"failure-domain.beta.kubernetes.io/zone"`  和key是`"failure-domain.beta.kubernetes.io/region"` 的label，跟`nodeConstraints`这个map对比，如果PV的label里面并没有node的zone label 的值的话，那么就说明该node不符合Pod的PV的要求，返回不满足false以及原因
 
 ```go
+// 代码位置 pkg/scheduler/framework/plugins/volumezone/volume_zone.go
+func (pl *VolumeZone) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *nodeinfo.NodeInfo) *framework.Status {
+	// 运行 predicate去执行过滤
+	_, reasons, err := pl.predicate(pod, nil, nodeInfo)
+	return migration.PredicateResultToFrameworkStatus(reasons, err)
+}
+
+
 // 代码位置 pkg/scheduler/algorithm/predicates/predicates.go
 func (c *VolumeZoneChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *schedulernodeinfo.NodeInfo) (bool, []PredicateFailureReason, error) {
-	// If a pod doesn't have any volume attached to it, the predicate will always be true.
-	// Thus we make a fast path for it, to avoid unnecessary computations in this case.
+	// 如果pod不需要volumes，直接返回即可
 	if len(pod.Spec.Volumes) == 0 {
 		return true, nil, nil
 	}
 
 	node := nodeInfo.Node()
-	if node == nil {
-		return false, nil, fmt.Errorf("node not found")
-	}
 
 	nodeConstraints := make(map[string]string)
+    // 轮询node节点的所有label，
+    // 获取key是`"failure-domain.beta.kubernetes.io/zone"`
+    // 和key是`"failure-domain.beta.kubernetes.io/region"` 的label的。添加到nodeConstraints map中
 	for k, v := range node.ObjectMeta.Labels {
 		if k != v1.LabelZoneFailureDomain && k != v1.LabelZoneRegion {
 			continue
@@ -192,10 +225,9 @@ func (c *VolumeZoneChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *sche
 		nodeConstraints[k] = v
 	}
 
-	if len(nodeConstraints) == 0 {
-		// The node has no zone constraints, so we're OK to schedule.
-		// In practice, when using zones, all nodes must be labeled with zone labels.
-		// We want to fast-path this case though.
+    // 如果nodeConstraints长度是空，也就是说明这个node节点没有约束，可以直接被调度
+	if len(nodeConstraints) == 0 {		
+        // 也就是说，当我们使用zone的时候，所有的node节点都需要打上zone的label
 		return true, nil, nil
 	}
 
@@ -218,6 +250,7 @@ func (c *VolumeZoneChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *sche
 			}
 
 			pvName := pvc.Spec.VolumeName
+            // 检查PVC是否存在
 			if pvName == "" {
 				scName := v1helper.GetPersistentVolumeClaimClass(pvc)
 				if len(scName) > 0 {
@@ -226,8 +259,8 @@ func (c *VolumeZoneChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *sche
 						if class.VolumeBindingMode == nil {
 							return false, nil, fmt.Errorf("VolumeBindingMode not set for StorageClass %q", scName)
 						}
+                        // 如果设置了延迟绑定，那么跳过该PVC
 						if *class.VolumeBindingMode == storage.VolumeBindingWaitForFirstConsumer {
-							// Skip unbound volumes
 							continue
 						}
 					}
@@ -243,18 +276,19 @@ func (c *VolumeZoneChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *sche
 			if pv == nil {
 				return false, nil, fmt.Errorf("PersistentVolume was not found: %q", pvName)
 			}
-
+			// 获取PV的label，获取key是`"failure-domain.beta.kubernetes.io/zone"`  和key是`"failure-domain.beta.kubernetes.io/region"` 的label，然后调用LabelZonesToSet解析pv的label
 			for k, v := range pv.ObjectMeta.Labels {
 				if k != v1.LabelZoneFailureDomain && k != v1.LabelZoneRegion {
 					continue
 				}
 				nodeV, _ := nodeConstraints[k]
+                // 从包含要设置的zone的分隔列表的字符串转换PV标签值
 				volumeVSet, err := volumehelpers.LabelZonesToSet(v)
 				if err != nil {
 					klog.Warningf("Failed to parse label for %q: %q. Ignoring the label. err=%v. ", k, v, err)
 					continue
 				}
-
+				// 如果PV的label里面并没有node的zone label 的值的话，那么就说明该node不符合Pod的PV的要求，返回不满足false以及原因
 				if !volumeVSet.Has(nodeV) {
 					klog.V(10).Infof("Won't schedule pod %q onto node %q due to volume %q (mismatch on %q)", pod.Name, node.Name, pvName, k)
 					return false, []PredicateFailureReason{ErrVolumeZoneConflict}, nil
@@ -268,10 +302,6 @@ func (c *VolumeZoneChecker) predicate(pod *v1.Pod, meta Metadata, nodeInfo *sche
 ```
 
 
-
-### 打分
-
-### 绑定
 
 ## PVC Controller
 
@@ -411,7 +441,102 @@ func FindMatchingVolume(
 
 
 
+# 总结
+
+持久卷PV是cluster scope的，可以提前由管理员手工provision，也可以使用`storage class`动态provision。以下是一个PV的具体输出，代码里面也经常出现轮询所有PV去查是`spec.claimRef`为空来判定该PV是否已经被PVC所绑定。
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: foo-pv
+spec:
+  storageClassName: ""
+  claimRef:
+    name: foo-pvc
+    namespace: foo
+  ...
+```
+
+PVC是namespace scope的，在PVC中，我们同样也可以声明PVC和PV的绑定关系。对于PVC Controller来说，他会使用`FindMatchingVolume` 来检查PVC和PV的容量大小，access mode是否一致来绑定。
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: foo-pvc
+  namespace: foo
+spec:
+  storageClassName: "" # 此处须显式设置空字符串，否则会被设置为默认的 StorageClass
+  volumeName: foo-pv
+```
+
+对PVC来说，当没有指定PV的名称去绑定的时候，也可以通过`storageClass`来动态provision，而这里一种非常值得注意的情况是，PVC Controller和调度器里面都会检查该PVC是否使用了延迟绑定，也就是`volumeBindingMode: WaitForFirstConsumer`，下面是一个设置延迟绑定的`storageClass`的例子。
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-csi
+provisioner: disk.csi.azure.com
+parameters:
+  skuname: StandardSSD_LRS  
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+```
+
+当`storageClass`是使用延迟绑定的时候，调度器和PVC Controller直接跳过该PVC，直到调度完成，`Kubelet`将pod启动的时候会根据`volumes.kubernetes.io/controller-managed-attach-detach: "true"`  annotation去判断是由pvc controller去attach，保证挂载的卷和机器处于同一个zone的情况。
+
+
+
+按照上面`volumezone`插件提到的node节点的label，下面我们使用AKS来看一个具体使用了zone的node节点信息。 这里有几个注意点，当一个node节点出现了`volumes.kubernetes.io/controller-managed-attach-detach: "true"` 的annotation的时候，也就是告诉PVC Controller，是PVC Controller来负责attach volume。而在labels里面我们看到两个重要的label: `failure-domain.beta.kubernetes.io/region: westus2` 和  `failure-domain.beta.kubernetes.io/zone: westus2-1 `  。调度器会检查annotation和label来决定该节点是否符合Pod的PVC需求。
+
+```yaml
+# kubectl get node aks-default-xx -o yaml
+apiVersion: v1
+kind: Node
+metadata:
+  annotations:
+    node.alpha.kubernetes.io/ttl: "0"
+    volumes.kubernetes.io/controller-managed-attach-detach: "true"
+  creationTimestamp: "2020-08-03Txx"
+  labels:
+    agentpool: default
+    ...    
+    failure-domain.beta.kubernetes.io/region: westus2
+    failure-domain.beta.kubernetes.io/zone: westus2-1    
+  name: aks-default-xx
+  resourceVersion: "133xx"
+  selfLink: /api/v1/nodes/aks-default-xx
+  uid: c1xx
+spec:
+  providerID: azure:///subscriptions/xx
+status:
+  addresses:
+  - address: aks-default-7xx
+    type: Hostname
+  - address: 10.xx
+    type: InternalIP  
+  capacity:
+    attachable-volumes-azure-disk: "8"
+    cpu: "4"
+    ephemeral-storage: 30xxKi
+    hugepages-1Gi: "0"
+    hugepages-2Mi: "0"
+    memory: 1xx6Ki
+    pods: "30"
+ ..  
+```
+
+
+
 # 如何解决问题
+
+从上述看完调度器涉及到PV和PVC插件的代码以及PVC Controller ，在调度器里面的`volumebinding` 插件是负责检查Pod需要使用的PV大小大于等于PVC容量，并且access mode一致，并不检查disk zone，而`volumezone`插件则是保证PV的label zone是包含了节点zone，也就是说如果要保证Deployment的Pod被调度到节点A, 而节点A是属于zone 1的，PVC的磁盘也是zone 1的话，可以通过调度器的`volumezone`插件来保证。
+
+而`volumezone`插件是从k8s  1.17的版本之后开始出现volumezone的插件，而在v1.16以及之前的版本，都没有volumezone ，具体看<https://github.com/kubernetes/kubernetes/tree/release-1.16/pkg/scheduler/algorithm/predicates>。
+
+另外一种思路是，PVC Controller里面也写明了在PVC没有指明PV name的情况下，**如果设置延迟绑定的PVC，不会做任何操作，直接返回**， 直到`Kubelet` 开始在node节点上创建Pod的时候才开始创建卷来保证zone一致。
 
 
 
