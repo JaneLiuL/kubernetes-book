@@ -152,39 +152,28 @@ func (m *managerImpl) Start(diskInfoProvider DiskInfoProvider, podFunc ActivePod
 
 ## synchronize 监控
 
-`synchronize` 是一个强制驱逐的阈值
+`synchronize` 是一个强制驱逐的阈值，一旦到达该阈值，就按pod优先级和资源qos来返回需要驱逐的pod列表。
 
 ```go
 // 代码位置 pkg/kubelet/eviction_manager.go
 func (m *managerImpl) synchronize(diskInfoProvider DiskInfoProvider, podFunc ActivePodsFunc) []*v1.Pod {
-	
-	klog.V(3).Infof("eviction manager: synchronize housekeeping")
-	// build the ranking functions (if not yet known)
-	// TODO: have a function in cadvisor that lets us know if global housekeeping has completed
-	if m.dedicatedImageFs == nil {
-		hasImageFs, ok := diskInfoProvider.HasDedicatedImageFs()
-		if ok != nil {
-			return nil
-		}
-		m.dedicatedImageFs = &hasImageFs
-		m.signalToRankFunc = buildSignalToRankFunc(hasImageFs)
-		m.signalToNodeReclaimFuncs = buildSignalToNodeReclaimFuncs(m.imageGC, m.containerGC, hasImageFs)
-	}
-
+	...
+    // activePods 其实就是 GetActivePods() 从podManager里面获取没有被terminate的pod列表
 	activePods := podFunc()
 	updateStats := true
 	summary, err := m.summaryProvider.Get(updateStats)
 	
+    // 距离上次更新的时间超过10分钟，那么调用UpdateThreshold 去更新
 	if m.clock.Since(m.thresholdsLastUpdated) > notifierRefreshInterval {
 		m.thresholdsLastUpdated = m.clock.Now()
 		for _, notifier := range m.thresholdNotifiers {
 			if err := notifier.UpdateThreshold(summary); err != nil {
-				klog.Warningf("eviction manager: failed to update %s: %v", notifier.Description(), err)
+				...
 			}
 		}
 	}
 
-	// make observations and get a function to derive pod usage stats relative to those observations.
+	// 进行观察并获得一个函数来导出与这些观察相关的pod使用统计数据。
 	observations, statsFunc := makeSignalObservations(summary)
 	debugLogObservations("observations", observations)
 
