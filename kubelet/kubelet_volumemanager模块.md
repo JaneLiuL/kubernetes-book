@@ -113,7 +113,7 @@ ls /var/lib/kubelet/pods/88364352-7a46-4397-8743-dcff5cf5068d/volumes/kubernetes
 
 接下来我们看看卷被作为'Block' volumeMode来挂载，同样我们创建Pod去消耗这个卷，只有spec.volumeMode改变，其他内容均不变， 但发现NFS类型无法创建block volumeMode，查询官网https://kubernetes.io/zh/docs/concepts/storage/persistent-volumes/#raw-block-volume-support 后发现NFS是不支持block VolumeMode，于是乎改CSI类型的PV。
 
-发现如果我们使用`Blcok`类型的volumeMode，在节点上
+发现如果我们使用`Block`类型的volumeMode，在节点上
 
 ```yaml
 
@@ -168,7 +168,7 @@ type DesiredStateOfWorld interface {
 
 
 
-- 
+
 
 ```go
 func (dsw *desiredStateOfWorld) AddPodToVolume(
@@ -280,7 +280,7 @@ spec:
 
 # desiredStateOfWorldPopulator
 
-`DesiredStateOfWorldPopulator`**定期**循环遍历action的pod列表，并确保每个pod都存在于world缓存的所需状态(如果它有卷的话)。它还验证处于desire状态的world缓存中的pods是否仍然存在，如果不存在，则删除它们。
+`DesiredStateOfWorldPopulator`**定期**循环遍历action的pod列表，并确保每个pod都存在于desire state of world缓存的所需状态(如果它有卷的话)。它还验证处于desire状态的world缓存中的pods是否仍然存在，如果不存在，则删除它们。
 
 我们来看看`DesiredStateOfWorldPopulator`的Run的工作流程：
 
@@ -449,7 +449,7 @@ type OperationExecutor interface {
     // 2. *将设备挂载到全局挂载路径(仅用于可挂载的卷)。
     // 3. *更新ActualStateOfWorld，以反映卷是全局挂载的(仅用于可挂载的卷)。
     // 4. *将卷挂载到pod指定的路径上。
-    // 5. *更新世界的实际状态，以反映卷已挂载到pod路径。参数“isRemount”是一种信息，用于调整日志记录的详细程度。例如，初始挂载比重新挂载更有记录价值。
+    // 5. *更新ActualStateOfWorld，以反映卷已挂载到pod路径。参数“isRemount”是一种信息，用于调整日志记录的详细程度。例如，初始挂载比重新挂载更有记录价值。
     // 对于'Block' volumeMode，这个方法从volumeToMount中指定的pod和全局映射路径创建到卷的符号链接。具体来说，它将:*等待设备完成挂载(仅用于可挂载的卷)。*更新ActualStateOfWorld，。使用符号链接将卷映射到全局映射路径。*使用符号链接将卷映射到pod设备映射路径。*更新ActualStateOfWorld，以反映卷是挂载/映射到pod路径。
 	MountVolume(waitForAttachTimeout time.Duration, volumeToMount VolumeToMount, actualStateOfWorld ActualStateOfWorldMounterUpdater, isRemount bool) error
 
@@ -476,6 +476,20 @@ err := rc.operationExecutor.MountVolume(
 
 ### AttachVolume
 
+Attach是卷的一个interface，并不是所有的卷都支持Attach, 例如NFS就不支持Attach,  如果实现了`NewAttacher`方法的卷的插件，就说明支持Attach， 当然我们也可以使用`CanAttach`来测试一个卷插件是否支持Attach.
+
+```go
+// 代码位置 pkg/volume/plugins.go
+type AttachableVolumePlugin interface {
+	DeviceMountableVolumePlugin
+	NewAttacher() (Attacher, error)
+	NewDetacher() (Detacher, error)	
+	CanAttach(spec *Spec) (bool, error)
+}
+```
+
+我们从上面的`Reconciler`可以看到， 定时会执行从desiredStateOfWorld缓存中获取所有需要挂载的volumens，保证需要被挂载的volume被mount，会先调用PodExistsInVolume检查卷是否被attach到节点上并且pod是挂载了该卷。然后触发了`AttachVolume()`,  会具体根据Volume.Spec查询是使用了哪个volume plugin, 然后再调用具体插件的的`NewAttacher()`方法以及执行`Attach`将卷attach到节点上，再更新ActualStateOfWorld缓存。
+
 ```go
 // 代码位置 pkg/volume/util/operationexecutor/operation_executor.go
 func (oe *operationExecutor) AttachVolume(
@@ -494,77 +508,27 @@ func (og *operationGenerator) GenerateAttachVolumeFunc(
 	actualStateOfWorld ActualStateOfWorldAttacherUpdater) volumetypes.GeneratedOperations {
 
 	attachVolumeFunc := func() (error, error) {
+        // 获取volume plugin
 		attachableVolumePlugin, err :=
 			og.volumePluginMgr.FindAttachablePluginBySpec(volumeToAttach.VolumeSpec)
-		if err != nil || attachableVolumePlugin == nil {
-			return volumeToAttach.GenerateError("AttachVolume.FindAttachablePluginBySpec failed", err)
+		...
 		}
-
+    	// 调用volume plugin的NewAttacher()方法
 		volumeAttacher, newAttacherErr := attachableVolumePlugin.NewAttacher()
-		if newAttacherErr != nil {
-			return volumeToAttach.GenerateError("AttachVolume.NewAttacher failed", newAttacherErr)
+		..
 		}
 
-		// Execute attach
+		// 调用volume plugin自己对应的 Attach方法去获取设备目录
 		devicePath, attachErr := volumeAttacher.Attach(
 			volumeToAttach.VolumeSpec, volumeToAttach.NodeName)
-
-		if attachErr != nil {
-			uncertainNode := volumeToAttach.NodeName
-			if derr, ok := attachErr.(*volerr.DanglingAttachError); ok {
-				uncertainNode = derr.CurrentNode
-			}
-			addErr := actualStateOfWorld.MarkVolumeAsUncertain(
-				v1.UniqueVolumeName(""),
-				volumeToAttach.VolumeSpec,
-				uncertainNode)
-			if addErr != nil {
-				klog.Errorf("AttachVolume.MarkVolumeAsUncertain fail to add the volume %q to actual state with %s", volumeToAttach.VolumeName, addErr)
-			}
-
-			// On failure, return error. Caller will log and retry.
-			return volumeToAttach.GenerateError("AttachVolume.Attach failed", attachErr)
-		}
-
-		// Successful attach event is useful for user debugging
-		simpleMsg, _ := volumeToAttach.GenerateMsg("AttachVolume.Attach succeeded", "")
-		for _, pod := range volumeToAttach.ScheduledPods {
-			og.recorder.Eventf(pod, v1.EventTypeNormal, kevents.SuccessfulAttachVolume, simpleMsg)
-		}
-		klog.Infof(volumeToAttach.GenerateMsgDetailed("AttachVolume.Attach succeeded", ""))
-
-		// Update actual state of world
+		...		
+		// 更新ActualStateOfWorld
 		addVolumeNodeErr := actualStateOfWorld.MarkVolumeAsAttached(
-			v1.UniqueVolumeName(""), volumeToAttach.VolumeSpec, volumeToAttach.NodeName, devicePath)
-		if addVolumeNodeErr != nil {
-			// On failure, return error. Caller will log and retry.
-			return volumeToAttach.GenerateError("AttachVolume.MarkVolumeAsAttached failed", addVolumeNodeErr)
-		}
-
+			v1.UniqueVolumeName(""), volumeToAttach.VolumeSpec, volumeToAttach.NodeName, devicePath)		
+		...
 		return nil, nil
 	}
-
-	eventRecorderFunc := func(err *error) {
-		if *err != nil {
-			for _, pod := range volumeToAttach.ScheduledPods {
-				og.recorder.Eventf(pod, v1.EventTypeWarning, kevents.FailedAttachVolume, (*err).Error())
-			}
-		}
-	}
-
-	attachableVolumePluginName := unknownAttachableVolumePlugin
-
-	// Get attacher plugin
-	attachableVolumePlugin, err :=
-		og.volumePluginMgr.FindAttachablePluginBySpec(volumeToAttach.VolumeSpec)
-	// It's ok to ignore the error, returning error is not expected from this function.
-	// If an error case occurred during the function generation, this error case(skipped one) will also trigger an error
-	// while the generated function is executed. And those errors will be handled during the execution of the generated
-	// function with a back off policy.
-	if err == nil && attachableVolumePlugin != nil {
-		attachableVolumePluginName = attachableVolumePlugin.GetPluginName()
-	}
-
+	
 	return volumetypes.GeneratedOperations{
 		OperationName:     "volume_attach",
 		OperationFunc:     attachVolumeFunc,
@@ -581,7 +545,19 @@ func (og *operationGenerator) GenerateAttachVolumeFunc(
 工作流程如下：
 
 1. 通过查询spec.VolumeMode来检查卷是属于什么模式，是文件系统模式还是块设备模式
-2. 
+2. 如果是文件系统模式挂载的卷:
+   1.  它将:*等待设备完成挂载(仅用于可挂载的卷)。*
+   2. 将设备挂载到全局挂载路径(仅用于可挂载的卷)。
+   3. 更新ActualStateOfWorld，以反映卷是全局挂载的(仅用于可挂载的卷)
+   4. 将卷挂载到pod指定的路径上。
+   5. 更新ActualStateOfWorld，
+3. 如果是块设备模式的卷，创建一个符号链接文件，通过这个文件将设备映射到 Pod 内部。
+   1. 它将:*等待设备完成挂载(仅用于可挂载的卷)。*
+   2. 更新ActualStateOfWorld
+   3. 使用符号链接将卷映射到全局映射路径。
+   4. 使用符号链接将卷映射到pod设备映射路径。
+   5. 更新ActualStateOfWorld，以反映卷是挂载/映射到pod路径。
+4. Run将volumeName和podName的连接添加到正在运行的操作列表中，并生成一个新的go携程来执行operationFunc
 
 ```go
 //代码位置 pkg/volume/util/operationexecutor/operation_executor.go
@@ -595,32 +571,17 @@ func (oe *operationExecutor) MountVolume(
 	
 	var generatedOperations volumetypes.GeneratedOperations
 	if fsVolume {
-		// Filesystem volume case
-		// Mount/remount a volume when a volume is attached
 		generatedOperations = oe.operationGenerator.GenerateMountVolumeFunc(
 			waitForAttachTimeout, volumeToMount, actualStateOfWorld, isRemount)
 
 	} else {
-		// Block volume case
-		// Creates a map to device if a volume is attached
+        // 如果是块设备模式的卷，创建一个符号链接文件，通过这个文件将设备映射到 Pod 内部。
 		generatedOperations, err = oe.operationGenerator.GenerateMapVolumeFunc(
 			waitForAttachTimeout, volumeToMount, actualStateOfWorld)
 	}
-	if err != nil {
-		return err
-	}
-	// Avoid executing mount/map from multiple pods referencing the
-	// same volume in parallel
-	podName := nestedpendingoperations.EmptyUniquePodName
-
-	// TODO: remove this -- not necessary
-	if !volumeToMount.PluginIsAttachable && !volumeToMount.PluginIsDeviceMountable {
-		// volume plugins which are Non-attachable and Non-deviceMountable can execute mount for multiple pods
-		// referencing the same volume in parallel
-		podName = util.GetUniquePodName(volumeToMount.Pod)
-	}
-
-	// TODO mount_device
+	
+	...
+	// Run将volumeName和podName的连接添加到正在运行的操作列表中，并生成一个新的go携程来执行operationFunc
 	return oe.pendingOperations.Run(
 		volumeToMount.VolumeName, podName, generatedOperations)
 }
@@ -630,6 +591,8 @@ func (oe *operationExecutor) MountVolume(
 
 
 # Run
+
+在Kubelet自身服务的启动的时候，会开启一个go协程通过`volumeManager.Run` 来启动`volumeManager`。
 
 Attach或者挂载Volume是需要一定时间， 在K8S中，会设计一套缓存，让这套缓存去保存卷的期望状态和真实状态，然后使用reconciler去调和，让需要被挂载的卷执行挂载，需要被卸载的卷执行卸载。
 
@@ -642,31 +605,40 @@ func (kl *Kubelet) Run(updates <-chan kubetypes.PodUpdate) {
 }
 ```
 
+`VolumeManager` 这个模块实际上工作流程很简单：
 
+1. 开启一个协程运行`desiredStateOfWorldPopulator`。
+   1. 而`DesiredStateOfWorldPopulator.Run`会**定期**循环遍历action的pod列表，并确保每个pod都存在于desire state of world缓存的所需状态(如果它有卷的话)
+2. 开启一个协程运行`reconciler`
+   1. `Reconciler.Run`也是一个定期的运行方法，通过触发attach、detach、mount和unmount操作来协调desire state和actual state。
+3. 通过检查kubeClient是否为nil ， 如果为空，则执行`vm.volumePluginMgr.Run()` 来启动CSIDriver的informer
 
 ```go
+// 代码位置 pkg/kubelet/volumemanager/volume_manager.go
 func (vm *volumeManager) Run(sourcesReady config.SourcesReady, stopCh <-chan struct{}) {
-	defer runtime.HandleCrash()
-
 	go vm.desiredStateOfWorldPopulator.Run(sourcesReady, stopCh)
 	klog.V(2).Infof("The desired_state_of_world populator starts")
 
 	klog.Infof("Starting Kubelet Volume Manager")
 	go vm.reconciler.Run(stopCh)
 
-
 	if vm.kubeClient != nil {
-		// start informer for CSIDriver
 		vm.volumePluginMgr.Run(stopCh)
 	}
-
 	<-stopCh
 	klog.Infof("Shutting down Kubelet Volume Manager")
 }
-
 ```
 
 
+
+# 总结
+
+整个VolumeManager实际上是从PodManager中获取所有Pod, 以及对应的PV/PVC， 分析该Pod是需要Attach 或者是Detach ， Mount 或者Unmount Volume的操作写入desire state，由于Volume的Attach/Mount之类的操作需要一定的时间，K8S是需要维护一套缓存，存储了卷的预期状态desire state和实际状态actual state， 通过触发操作，来更新actual state。
+
+
+
+![](./images/volumemanager.png)
 
 # Reference
 
