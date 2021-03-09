@@ -38,11 +38,13 @@
 
   \- 4.4. [Kubelet nodestatus更新节点状态模块](/kubelet/kubelet_nodestatus模块.md)
 
-  \- 4.5. [Kubelet eviction驱逐模块](/kubelet/kubelet_eviction驱逐模块.md)
+  \- 4.5. [kubelet_volumemanager模块](/kubelet/kubelet_volumemanager模块.md)
 
-  \- 4.6. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
+plan: volume_plugin.md
 
-plan: volumeMnager模块
+  \- 4.6. [Kubelet eviction驱逐模块](/kubelet/kubelet_eviction驱逐模块.md)
+
+  \- 4.7. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
 
 plan: probeMnager模块
 
@@ -60,6 +62,10 @@ plan: probeMnager模块
 ​	  \- 4.2.4.  部署CSI 驱动
 ​	 \- 4.2.5.  如何测试驱动
 ​	  \- 4.2.6.  如何编写一个本地存储
+
+第六章. 应用篇
+
+  \- 5.1.  [pvc延迟绑定](/应用篇/pvc延迟绑定.md)
 
 
 
