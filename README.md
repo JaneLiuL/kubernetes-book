@@ -40,11 +40,13 @@
 
   \- 4.5. [kubelet_volumemanager模块](/kubelet/kubelet_volumemanager模块.md)
 
-plan: volume_plugin.md
+  \- 4.6. [volume_plugin](/kubelet/volume_plugin.md)
 
-  \- 4.6. [Kubelet eviction驱逐模块](/kubelet/kubelet_eviction驱逐模块.md)
+TODO: PodManager模块
 
-  \- 4.7. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
+  \- 4.7. Need to update [Kubelet eviction驱逐模块](/kubelet/kubelet_eviction驱逐模块.md) 
+
+  \- 4.8. [Kubelet statusManager状态管理模块](/kubelet/kubelet状态管理statusManager.md)
 
 plan: probeMnager模块
 

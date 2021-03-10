@@ -9,7 +9,6 @@ Commid id: 370e2f4b298e7276f560c131e24d8f91b88ae89f
 # 带着问题出发
 
 1. volume 定义了什么接口
-2. volume plugin是什么时候被调用
 3. volume plugin是什么时候被注册的, 如何管理和扩展这些插件
 
 
@@ -113,26 +112,59 @@ type PersistentVolumePlugin interface {
 
 
 
-# VolumePluginMgr
+# 初始化卷插件
+
+我们先分析`kubelet` cmd目录下的代码，通过调用链关系（如下所示），可获取kubelet的插件是通过`ProbeVolumePlugins` 来返回的
+
+```bash
+main()
+	app.NewKubeletCommand()		
+		UnsecuredDependencies() # 构造默认的KubeletDeps
+			plugins, err := ProbeVolumePlugins(featureGate)
+```
+
+接下来我们看看`ProbeVolumePlugins` 
 
 ```go
-// 代码位置 pkg/volume/plugins.go
-type VolumePluginMgr struct {
-	mutex         sync.Mutex
-	plugins       map[string]VolumePlugin
-	prober        DynamicPluginProber
-	probedPlugins map[string]VolumePlugin
-	Host          VolumeHost
+func ProbeVolumePlugins(featureGate featuregate.FeatureGate) ([]volume.VolumePlugin, error) {
+	allPlugins := []volume.VolumePlugin{}
+
+	var err error
+    // Legacy 的卷是指云厂商提供的，例如awsebs, azuredisk等
+	allPlugins, err = appendLegacyProviderVolumes(allPlugins, featureGate)
+	// 然后再把常用的卷插件，nfs, iscsi等添加到allPlugins
+	allPlugins = append(allPlugins, emptydir.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, git_repo.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, hostpath.ProbeVolumePlugins(volume.VolumeConfig{})...)
+	allPlugins = append(allPlugins, nfs.ProbeVolumePlugins(volume.VolumeConfig{})...)
+	allPlugins = append(allPlugins, secret.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, iscsi.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, glusterfs.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, rbd.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, quobyte.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, cephfs.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, downwardapi.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, fc.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, flocker.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, configmap.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, projected.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, portworx.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, scaleio.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, local.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, storageos.ProbeVolumePlugins()...)
+	allPlugins = append(allPlugins, csi.ProbeVolumePlugins()...)
+	return allPlugins, nil
 }
 ```
 
+以上，也就是说，我们`pkg/volume/`下的插件都被添加进`allPlugins`。
 
 
-## 实例化
 
-`VolumePluginMgr` 是在实例化kubelet的时候被实例化的。
+同样的，`VolumePluginMgr` 是在实例化kubelet的时候被实例化的。
 
 ```go
+// 代码为 pkg/kubelet/kubelet.go
 func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,...) (*Kubelet, error) {	
     ...
 	klet.volumePluginMgr, err =
@@ -141,31 +173,21 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,...) (*K
 }
 ```
 
+通过调用链关系`NewInitializedVolumePluginMgr()` --> `kvh.volumePluginMgr.InitPlugins()`， 来把所有卷插件都初始化。
 
+ 我们来看看`InitPlugins`方法的工作流程：
 
-调用链关系如下
-
-```
-NewInitializedVolumePluginMgr()
-	kvh.volumePluginMgr.InitPlugins()
-```
-
-
-
-接下来我们查看`VolumePluginMgr`在实例化之后被执行了`InitPlugins`。 我们来看看该方法的工作流程：
-
-
+1. 轮询所有卷插件
+2. 检验卷插件name, 也就是必须要包含/， pattern是example.com/somename
+3. 调用卷插件各自的Init方法
+4.  将卷插件加载到VolumePluginMgr， 至此所有插件已经被注册进VolumePluginMgr对象中
 
 ```go
 // 代码位置 pkg/volume/plugins.go
-func (pm *VolumePluginMgr) InitPlugins(plugins []VolumePlugin, prober DynamicPluginProber, host VolumeHost) error {
-	pm.mutex.Lock()
-	defer pm.mutex.Unlock()
-
+func (pm *VolumePluginMgr) InitPlugins(plugins []VolumePlugin, prober DynamicPluginProber, host VolumeHost) error {	
+    
 	pm.Host = host
-
 	if prober == nil {
-		// Use a dummy prober to prevent nil deference.
 		pm.prober = &dummyPluginProber{}
 	} else {
 		pm.prober = prober
@@ -184,8 +206,10 @@ func (pm *VolumePluginMgr) InitPlugins(plugins []VolumePlugin, prober DynamicPlu
 	}
 
 	allErrs := []error{}
+    // 轮询所有卷插件，（插件列表可以见上方ProbeVolumePlugins）
 	for _, plugin := range plugins {
 		name := plugin.GetPluginName()
+        // 检验卷插件name, 也就是必须要包含/， pattern是example.com/somename
 		if errs := validation.IsQualifiedName(name); len(errs) != 0 {
 			allErrs = append(allErrs, fmt.Errorf("volume plugin has invalid name: %q: %s", name, strings.Join(errs, ";")))
 			continue
@@ -195,16 +219,16 @@ func (pm *VolumePluginMgr) InitPlugins(plugins []VolumePlugin, prober DynamicPlu
 			allErrs = append(allErrs, fmt.Errorf("volume plugin %q was registered more than once", name))
 			continue
 		}
+        // 调用卷插件各自的Init方法
 		err := plugin.Init(host)
-		if err != nil {
-			klog.Errorf("Failed to load volume plugin %s, error: %s", name, err.Error())
-			allErrs = append(allErrs, err)
-			continue
-		}
+		// 将卷插件加载到VolumePluginMgr
 		pm.plugins[name] = plugin
-		klog.V(1).Infof("Loaded volume plugin %q", name)
 	}
 	return utilerrors.NewAggregate(allErrs)
 }
 ```
+
+
+
+
 
