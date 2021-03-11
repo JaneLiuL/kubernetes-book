@@ -42,6 +42,8 @@
 
   \- 4.6. [volume_plugin](/kubelet/volume_plugin.md)
 
+  \- 4.7. [kubelet_PodManager模块](/kubelet/kubelet_podmanager模块.md)
+
 TODO: PodManager模块
 
   \- 4.7. Need to update [Kubelet eviction驱逐模块](/kubelet/kubelet_eviction驱逐模块.md) 
