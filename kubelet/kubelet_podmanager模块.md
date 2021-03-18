@@ -41,7 +41,7 @@ EOF
 
 ## Mirror Pod
 
-静态Pod是不能被API Server来控制的， 为了让用户/Kubelet通过API Server来管理静态Pod, Kubelet会创建一个叫Mirror Pod，Mirror Pod其实跟Static Pod是一一对应的。
+静态Pod是不能被API Server来控制的， 为了让用户或者Kubelet通过API Server来管理静态Pod, Kubelet会创建一个叫Mirror Pod，Mirror Pod其实跟Static Pod是一一对应的。
 
 如何查询一个Pod是否是Mirror Pod呢，Mirror Pod是带了`"kubernetes.io/config.mirror"`的Annotation
 
@@ -80,7 +80,43 @@ spec:
 
 
 
+## 获取Pod 来源
+
+查询Pod的Annotation， key是`"kubernetes.io/config.source"` 的值对应就是这个Pod的来源
+
+```go
+// 代码位置 pkg/kubelet/types/pod_update.go
+func GetPodSource(pod *v1.Pod) (string, error) {
+	if pod.Annotations != nil {
+		if source, ok := pod.Annotations[ConfigSourceAnnotationKey]; ok {
+			return source, nil
+		}
+	}
+	return "", fmt.Errorf("cannot get source of pod %q", pod.UID)
+}
+```
+
+
+
+## 静态Pod和Mirror  pod Mapping
+
+通过一个Mirror Pod获取它对应的Static Pod，首先查询Mirror Pod的FullName， 然后查询`basicManager`对象的`podByFullName` map可得。
+
+Pod的Full Name其实就是 `pod.Name + "_" + pod.Namespace`
+
+```go
+// 代码位置 pkg/kubelet/pod/pod_manager.go
+func (pm *basicManager) GetPodByMirrorPod(mirrorPod *v1.Pod) (*v1.Pod, bool) {
+	pm.lock.RLock()
+	defer pm.lock.RUnlock()
+	pod, ok := pm.podByFullName[kubecontainer.GetPodFullName(mirrorPod)]
+	return pod, ok
+}
+```
+
 # 实例化
+
+`Kubelet` 在实例化的时候，会调用`NewBasicMirrorClient` 和 `NewBasicPodManager` 去实例化podManager。
 
 ```go
 // 代码位置 pkg/kubelet/kubelet.go
@@ -93,7 +129,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,...){
 
 ```
 
-
+实例化的时候，传入了`secretManager`和`configMapManager` ，这是因为当Pod需要使用`secret`或者`configmap`的时候，需要Podmanager创建对应的监听，监听资源的变化来写入缓存
 
 ```go
 // 代码位置 pkg/kubelet/pod/pod_manager.go
@@ -108,7 +144,9 @@ func NewBasicPodManager(client MirrorClient, secretManager secret.Manager, confi
 }
 ```
 
-## TODO
+
+
+Kubelet有三种Pod来源，分别是File, http和API Server。
 
 ```go
 // 代码位置 pkg/kubelet/kubelet.go
@@ -117,6 +155,7 @@ func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, ku
 	if len(kubeCfg.StaticPodURLHeader) > 0 {
 		for k, v := range kubeCfg.StaticPodURLHeader {
 			for i := range v {
+                // 添加header
 				manifestURLHeader.Add(k, v[i])
 			}
 		}
@@ -124,16 +163,14 @@ func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, ku
 
 	// source of all configuration
 	cfg := config.NewPodConfig(config.PodConfigNotificationIncremental, kubeDeps.Recorder)
-
-	// define file config source
-	if kubeCfg.StaticPodPath != "" {
-		klog.Infof("Adding pod path: %v", kubeCfg.StaticPodPath)
+	
+    // 定义 StaticPodPath 目录
+	if kubeCfg.StaticPodPath != "" {		
 		config.NewSourceFile(kubeCfg.StaticPodPath, nodeName, kubeCfg.FileCheckFrequency.Duration, cfg.Channel(kubetypes.FileSource))
 	}
 
-	// define url config source
-	if kubeCfg.StaticPodURL != "" {
-		klog.Infof("Adding pod url %q with HTTP header %v", kubeCfg.StaticPodURL, manifestURLHeader)
+	// 定义 http 来源URL
+	if kubeCfg.StaticPodURL != "" {	
 		config.NewSourceURL(kubeCfg.StaticPodURL, manifestURLHeader, nodeName, kubeCfg.HTTPCheckFrequency.Duration, cfg.Channel(kubetypes.HTTPSource))
 	}
 
@@ -151,6 +188,7 @@ func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, ku
 		}
 	}
 
+    // 添加API Server为第三种source
 	if kubeDeps.KubeClient != nil {
 		klog.Infof("Watching apiserver")
 		if updatechannel == nil {
@@ -159,106 +197,6 @@ func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, ku
 		config.NewSourceApiserver(kubeDeps.KubeClient, nodeName, updatechannel)
 	}
 	return cfg, nil
-}
-```
-
-
-
-# 调用关系
-
-
-
-# Kubelet更新Pod
-
-```go
-// 代码位置 pkg/kubelet/kubelet.go
-func makePodSourceConfig(kubeCfg *kubeletconfiginternal.KubeletConfiguration, kubeDeps *Dependencies, nodeName types.NodeName, bootstrapCheckpointPath string) (*config.PodConfig, error) {
-	manifestURLHeader := make(http.Header)
-	if len(kubeCfg.StaticPodURLHeader) > 0 {
-		for k, v := range kubeCfg.StaticPodURLHeader {
-			for i := range v {
-				manifestURLHeader.Add(k, v[i])
-			}
-		}
-	}
-
-	// source of all configuration
-	cfg := config.NewPodConfig(config.PodConfigNotificationIncremental, kubeDeps.Recorder)
-
-	// define file config source
-	if kubeCfg.StaticPodPath != "" {
-		klog.Infof("Adding pod path: %v", kubeCfg.StaticPodPath)
-		config.NewSourceFile(kubeCfg.StaticPodPath, nodeName, kubeCfg.FileCheckFrequency.Duration, cfg.Channel(kubetypes.FileSource))
-	}
-
-	// define url config source
-	if kubeCfg.StaticPodURL != "" {
-		klog.Infof("Adding pod url %q with HTTP header %v", kubeCfg.StaticPodURL, manifestURLHeader)
-		config.NewSourceURL(kubeCfg.StaticPodURL, manifestURLHeader, nodeName, kubeCfg.HTTPCheckFrequency.Duration, cfg.Channel(kubetypes.HTTPSource))
-	}
-
-	// Restore from the checkpoint path
-	// NOTE: This MUST happen before creating the apiserver source
-	// below, or the checkpoint would override the source of truth.
-
-	var updatechannel chan<- interface{}
-	if bootstrapCheckpointPath != "" {
-		klog.Infof("Adding checkpoint path: %v", bootstrapCheckpointPath)
-		updatechannel = cfg.Channel(kubetypes.ApiserverSource)
-		err := cfg.Restore(bootstrapCheckpointPath, updatechannel)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if kubeDeps.KubeClient != nil {
-		klog.Infof("Watching apiserver")
-		if updatechannel == nil {
-			updatechannel = cfg.Channel(kubetypes.ApiserverSource)
-		}
-		config.NewSourceApiserver(kubeDeps.KubeClient, nodeName, updatechannel)
-	}
-	return cfg, nil
-}
-```
-
-
-
-```go
-// 代码位置 pkg/kubelet/types/pod_update.go
-func GetValidatedSources(sources []string) ([]string, error) {
-	validated := make([]string, 0, len(sources))
-	for _, source := range sources {
-		switch source {
-		case AllSource:
-			return []string{FileSource, HTTPSource, ApiserverSource}, nil
-		case FileSource, HTTPSource, ApiserverSource:
-			validated = append(validated, source)
-		case "":
-			// Skip
-		default:
-			return []string{}, fmt.Errorf("unknown pod source %q", source)
-		}
-	}
-	return validated, nil
-}
-```
-
-
-
-## 获取Pod 来源
-
-查询Pod的Annotation， key是`"kubernetes.io/config.source"` 的值对应就是这个Pod的来源
-
-```go
-// 代码位置 pkg/kubelet/types/pod_update.go
-func GetPodSource(pod *v1.Pod) (string, error) {
-	if pod.Annotations != nil {
-		if source, ok := pod.Annotations[ConfigSourceAnnotationKey]; ok {
-			return source, nil
-		}
-	}
-	return "", fmt.Errorf("cannot get source of pod %q", pod.UID)
 }
 ```
 
@@ -414,6 +352,8 @@ func (s *sourceFile) produceWatchEvent(e *fsnotify.Event) error {
 
 ### 消费者
 
+这里的消费者只是放入缓存，真正的消费者，仍然是背后的`syncLoop`。
+
 消费者的工作流程如下：
 
 `eventType`属于增加/更改的情况下：
@@ -456,11 +396,39 @@ func (s *sourceFile) consumeWatchEvent(e *watchEvent) error {
 
 ## http
 
-http模式主要是用于用户直接通过http 请求kubelet的URL来增删除Pod，通过http请求将事件写入channel中。
+http模式跟file模式类似，也是kubelet定期去扫描，不一样的是，http模式是定期到`manifest-url` 参数配置定期下载指定文件，并且转行成yaml格式的Pod文件，再去创建静态Pod。
+
+（通过kubelet的启动参数`–manifest-url` `–manifest-url-header`来定义manifest url。 ）
+
+举个例子，我们创建以下yaml 文件，并且保存在一个我们自己的web服务上，生成一个URL
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: http-web
+  labels:
+    role: myrole
+spec:
+  containers:
+    - name: web
+      image: nginx
+      ports:
+        - name: web
+          containerPort: 80
+          protocol: TCP
+```
+
+当我们的Kubelet启动的时候带上`KUBELET_ARGS="--manifest-url=<manifest-url>"` 那么该静态Pod就会被创建。
+
+
 
 工作流程如下：
 
-1. 使用Get尝试发送http 请求，
+1. 使用Get尝试发送http 请求下载文件， 尝试检查response.StatusCode是否是200，以及返回的数据大小
+2. 比对上次读取的数据有没有发生改变，如果没有改变，则直接返回
+3. 走到这里，说明数据是发生了改变，尝试decode是否是一个Pod，检验数据是否是Pod格式，如果没有错误，则将Pod数据和Pod source: `kubetypes.HTTPSource` 写入到channel中。
+4. 尝试decode 是否是多个Pod， 如果是，则轮询将数据写入pods中，然后写入到channel中。
 
 ```go
 // 代码位置 pkg/kubelet/config/http.go
@@ -477,17 +445,16 @@ func (s *sourceURL) extractFromURL() error {
 		return fmt.Errorf("%v: %v", s.url, resp.Status)
 	}
 	if len(data) == 0 {
-		// Emit an update with an empty PodList to allow HTTPSource to be marked as seen
 		s.updates <- kubetypes.PodUpdate{Pods: []*v1.Pod{}, Op: kubetypes.SET, Source: kubetypes.HTTPSource}
 		return fmt.Errorf("zero-length data received from %v", s.url)
 	}
-	// Short circuit if the data has not changed since the last time it was read.
+	// 比对上次读取的数据有没有发生改变，如果没有改变，则直接返回
 	if bytes.Equal(data, s.data) {
 		return nil
 	}
 	s.data = data
 
-	// First try as it is a single pod.
+	// 尝试decode是否是一个Pod，检验数据是否是Pod格式
 	parsed, pod, singlePodErr := tryDecodeSinglePod(data, s.applyDefaults)
 	if parsed {
 		if singlePodErr != nil {
@@ -498,7 +465,7 @@ func (s *sourceURL) extractFromURL() error {
 		return nil
 	}
 
-	// That didn't work, so try a list of pods.
+	// 尝试decode 是否是多个Pod， 如果是，则轮询将数据写入pods中，然后写入到channel中
 	parsed, podList, multiPodErr := tryDecodePodList(data, s.applyDefaults)
 	if parsed {
 		if multiPodErr != nil {
@@ -519,33 +486,25 @@ func (s *sourceURL) extractFromURL() error {
 }
 ```
 
-单元测试
-
 
 
 ## API Server
 
-到时候记得加个图
+这是我们最常用的Pod创建方法，也就是用户通过`kubectl apply -f `的方法将数据传给API Server， 经过调度器选出节点后，节点监听到是本机则在本机启动该Pod。这种方法创建的Pod不是静态Pod。
 
 
 
-## 静态Pod和Mirror  pod Mapping
+# 和其他模块的关系
 
-通过一个Mirror Pod获取它对应的Static Pod，首先查询Mirror Pod的FullName， 然后查询`basicManager`对象的`podByFullName` map可得。
+然后podMgmt调用secretManger和configmapManager
 
-Pod的Full Name其实就是 `pod.Name + "_" + pod.Namespace`
+然后以下三个都调用 Pod Manager
 
-```go
-// 代码位置 pkg/kubelet/pod/pod_manager.go
-func (pm *basicManager) GetPodByMirrorPod(mirrorPod *v1.Pod) (*v1.Pod, bool) {
-	pm.lock.RLock()
-	defer pm.lock.RUnlock()
-	pod, ok := pm.podByFullName[kubecontainer.GetPodFullName(mirrorPod)]
-	return pod, ok
-}
-```
+status Manager																				
 
+volume Manager             
 
+runtime Manager
 
 # why need podManager
 
