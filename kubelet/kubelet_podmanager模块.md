@@ -492,6 +492,31 @@ func (s *sourceURL) extractFromURL() error {
 
 这是我们最常用的Pod创建方法，也就是用户通过`kubectl apply -f `的方法将数据传给API Server， 经过调度器选出节点后，节点监听到是本机则在本机启动该Pod。这种方法创建的Pod不是静态Pod。
 
+主要工作流程是：
+
+1. 监听来自API Server的Pod的消息（只监听Pod.nodename跟本节点nodeName一致）
+2. 将从1收到的消息，把Pod信息和来源，写入到channe中。
+
+```go
+// 代码位置 pkg/kubelet/config/apiserver.go
+func NewSourceApiserver(c clientset.Interface, nodeName types.NodeName, updates chan<- interface{}) {
+	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector(api.PodHostField, string(nodeName)))
+	newSourceApiserverFromLW(lw, updates)
+}
+
+func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- interface{}) {
+	send := func(objs []interface{}) {
+		var pods []*v1.Pod
+		for _, o := range objs {
+			pods = append(pods, o.(*v1.Pod))
+		}
+		updates <- kubetypes.PodUpdate{Pods: pods, Op: kubetypes.SET, Source: kubetypes.ApiserverSource}
+	}
+	r := cache.NewReflector(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), 0)
+	go r.Run(wait.NeverStop)
+}
+```
+
 
 
 # 和其他模块的关系
