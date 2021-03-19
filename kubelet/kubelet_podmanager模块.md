@@ -519,6 +519,124 @@ func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- interface{}
 
 
 
+# basicManager
+
+`basicManager` 是Kubelet下的一个模块，是负责保存Pod的数据，所有在baseManager的字段都是只读，然后被`SetPods`、 `AddPod`、`UpdatePod` 、`DeletePod`负责调用。
+
+## 数据结构
+
+```go
+type basicManager struct {
+	// Protects all internal maps.
+	lock sync.RWMutex
+
+	// Regular pods indexed by UID.
+	podByUID map[kubetypes.ResolvedPodUID]*v1.Pod
+	// Mirror pods indexed by UID.
+	mirrorPodByUID map[kubetypes.MirrorPodUID]*v1.Pod
+
+	// Pods indexed by full name for easy access.
+	podByFullName       map[string]*v1.Pod
+	mirrorPodByFullName map[string]*v1.Pod
+
+	// Mirror pod UID to pod UID map.
+	translationByUID map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID
+
+	// basicManager is keeping secretManager and configMapManager up-to-date.
+	secretManager     secret.Manager
+	configMapManager  configmap.Manager
+	checkpointManager checkpointmanager.CheckpointManager
+
+	// A mirror pod client to create/delete mirror pods.
+	MirrorClient
+}
+```
+
+
+
+## 单元测试
+
+```go
+// 代码位置 pkg/kubelet/pod/pod_manager.go
+func TestGetSetPods(t *testing.T) {
+	mirrorPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "987654321",
+			Name:      "bar",
+			Namespace: "default",
+			Annotations: map[string]string{
+				kubetypes.ConfigSourceAnnotationKey: "api",
+				kubetypes.ConfigMirrorAnnotationKey: "mirror",
+			},
+		},
+	}
+	staticPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:         "123456789",
+			Name:        "bar",
+			Namespace:   "default",
+			Annotations: map[string]string{kubetypes.ConfigSourceAnnotationKey: "file"},
+		},
+	}
+
+	expectedPods := []*v1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "999999999",
+				Name:        "taco",
+				Namespace:   "default",
+				Annotations: map[string]string{kubetypes.ConfigSourceAnnotationKey: "api"},
+			},
+		},
+		staticPod,
+	}
+	updates := append(expectedPods, mirrorPod)
+	podManager, _ := newTestManager()
+	podManager.SetPods(updates)
+
+	// Tests that all regular pods are recorded correctly.
+	actualPods := podManager.GetPods()
+	if len(actualPods) != len(expectedPods) {
+		t.Errorf("expected %d pods, got %d pods; expected pods %#v, got pods %#v", len(expectedPods), len(actualPods),
+			expectedPods, actualPods)
+	}
+	for _, expected := range expectedPods {
+		found := false
+		for _, actual := range actualPods {
+			if actual.UID == expected.UID {
+				if !reflect.DeepEqual(&expected, &actual) {
+					t.Errorf("pod was recorded incorrectly. expect: %#v, got: %#v", expected, actual)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("pod %q was not found in %#v", expected.UID, actualPods)
+		}
+	}
+	// Tests UID translation works as expected. Convert static pod UID for comparison only.
+	if uid := podManager.TranslatePodUID(mirrorPod.UID); uid != kubetypes.ResolvedPodUID(staticPod.UID) {
+		t.Errorf("unable to translate UID %q to the static POD's UID %q; %#v",
+			mirrorPod.UID, staticPod.UID, podManager.mirrorPodByUID)
+	}
+
+	// Test the basic Get methods.
+	actualPod, ok := podManager.GetPodByFullName("bar_default")
+	if !ok || !reflect.DeepEqual(actualPod, staticPod) {
+		t.Errorf("unable to get pod by full name; expected: %#v, got: %#v", staticPod, actualPod)
+	}
+	actualPod, ok = podManager.GetPodByName("default", "bar")
+	if !ok || !reflect.DeepEqual(actualPod, staticPod) {
+		t.Errorf("unable to get pod by name; expected: %#v, got: %#v", staticPod, actualPod)
+	}
+
+}
+
+```
+
+
+
 # 和其他模块的关系
 
 然后podMgmt调用secretManger和configmapManager
