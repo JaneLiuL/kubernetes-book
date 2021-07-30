@@ -13,7 +13,6 @@ Pod资源对象， 而K8S中是怎么把所属资源也一并删除的呢？
 如果需要，还可以手动设置ownerReferences。
 一个对象可以有多个ownerReferences，例如在namespace中。
 
-
 在用于未使用对象GC的K8中，有两大类：
 级联：在级联之一中，所有者的删除导致从群集中删除从属对象。
 孤儿：顾名思义，对所有者对象的删除操作只会将其从集群中删除，并使所有从属对象处于"孤儿"状态。
@@ -283,5 +282,18 @@ runAttemptToOrphanWorker
 
 
 
+## 注意事项
 
+今天在写代码的时候加了这一段`obj.SetOwnerReferences(append(obj.GetOwnerReferences(), ownerRef))` 到代码中，需求是希望创建keycloak client同时创建secret到不同namespace, 然后给这些secret添加ownerreference，但发现没有任何error捕获到，查了event有如下warning。
+
+```
+ownerRef [xxx/xxx, namespace: xxx, name: client, uid: 866ef543-22fb-4ec5-b253-63809d3abd22] does not exist in namespace "xx"
+```
+
+然后翻查代码后发现
+
+```
+namespace-scoped的资源添加namespace-scope级别的owner reference的时候，owner reference只能添加在同一个namespace，不能跨namespace添加； 或者可以添加owner reference为cluster-scoped级别的资源
+cluster-scoped的资源只能添加cluster scope级别的owner references
+```
 
