@@ -5,7 +5,6 @@ Pod资源对象， 而K8S中是怎么把所属资源也一并删除的呢？
 没错，就是GC Controller发挥的作用，GC Controller会将被删除对象的附属资源查询并且一并删除。
 垃圾回收就是从系统中删除未使用的对象，并释放分配给它们的计算资源。
 
-
 与面向对象的语言不同，在K8s对象清单定义中，我们从来没有明确定义或编写与所有者相关的关系，而是系统如何确定该关系? 
 在K8s中，每个从属对象都有一个唯一的元数据字段名称metas.ownerReferences用于关系表示。
 
@@ -13,272 +12,267 @@ Pod资源对象， 而K8S中是怎么把所属资源也一并删除的呢？
 如果需要，还可以手动设置ownerReferences。
 一个对象可以有多个ownerReferences，例如在namespace中。
 
-在用于未使用对象GC的K8中，有两大类：
-级联：在级联之一中，所有者的删除导致从群集中删除从属对象。
-孤儿：顾名思义，对所有者对象的删除操作只会将其从集群中删除，并使所有从属对象处于"孤儿"状态。
-
-工作原理：
-dependencyGraphBuilder: 这个是一个用来查询检查K8S集群里面的资源，会无线循环执行monitor，查询集群中的资源，并且添加到dirty_queue中
-
-runAttemptToDeleteWorker和runAttemptToOrphanWorker: 定期运行，从dirty_queue中获取，检查OwnerReference是否为空，
-如果为空则取下一个继续处理，否则检查OwnerReferences元数据中的每个条目， 如果OwnerReferences中列出的所有者都不存在，那么worker会删除这个对象
+此篇文档主要是讲述GC Controller的工作流程，
 
 
-数据结构
-GarbageCollector里面有两个队列，一个是`attemptToDelete`，另外一个是`attemptToOrphan`
-attemptToDelete： 当时机成熟时，垃圾收集器尝试删除队列attemptToDelete中的项。
-attemptToOrphan： 垃圾收集器尝试使attemptToOrphan队列中的项的依赖项成为孤儿，然后删除这些项。
 
-type GarbageCollector struct {
-	restMapper     resettableRESTMapper
-	metadataClient metadata.Interface
-	// garbage collector attempts to delete the items in attemptToDelete queue when the time is ripe.
-	attemptToDelete workqueue.RateLimitingInterface
-	// garbage collector attempts to orphan the dependents of the items in the attemptToOrphan queue, then deletes the items.
-	attemptToOrphan        workqueue.RateLimitingInterface
-	dependencyGraphBuilder *GraphBuilder
-	// GC caches the owners that do not exist according to the API server.
-	absentOwnerCache *ReferenceCache
+GC Controller 是controller-manager下的一个controller之一，主要作用是删除需要删除的对象，以及该对象的下属关系。
 
-	workerLock sync.RWMutex
+为什么GC 需要以一个controller 的形式去运转， 我在阅读这个代码之前一直觉得应该是让kubelet 去操作才对，直到我读了这个Design proposal: https://github.com/kubernetes/community/blob/master/contributors/design-proposals/api-machinery/garbage-collection.md#overview 在这里简单翻译一下：
+
+1. 支持服务器端Cascading deletion级联删除。简单理解一下其实是利用已经建立的父子关系(ownerreference)来删除，例如当一个pod的owner已经被删除的时候，就认为这个pod是没有人管需要删除
+2. 集中级联删除逻辑，而不是在控制器中扩展。
+3. 允许有选择地孤立依赖对象
+
+# 代码理解
+
+## API 部分
+
+在ObjectMeta 中 引入了OwnerReferences, 去列出所有该对象依赖的对象们简称父亲们。 如果所有父亲们都被删除，那么这个对象就会被GC。
+
+另外一个是在ObjectMeta 中 引入了Finalizers 列表，去列出所有在删除这个对象之前的终结者们。 当这个对象被彻底从集群中删除之前这个列表是必须清空。列表中的每个字符串都是负责从列表中删除条目的组件的标识符。如果该对象的deletionTimestamp为非nil，则只能删除该列表中的条目。出于安全原因，更新终结器需要特殊的特权。为了实施允许规则，我们将终结器作为子资源公开，并禁止在更新主资源时直接更改终结器。
+
+有一个特别需要注意的事情是，OwnerReference这个Struct是没有namespace字段的，也就是说，父亲们如果是namespace scope的就必须是同一个namespace。
+
+```go
+type ObjectMeta struct {
+	...
+	OwnerReferences []OwnerReference
+    Finalizers []string
 }
 
-运行
+type OwnerReference struct {
+	// Version of the referent.
+	APIVersion string
+	// Kind of the referent.
+	Kind string
+	// Name of the referent.
+	Name string
+	// UID of the referent.
+	UID types.UID
+}
+```
+
+对API Server来说，当一个对象的`ObjectMeta.Finalizers`是非空的时候，需要更新`DeletionTimestamp`。 当`ObjectMeta.Finalizers` 非空然后`options.GracePeriod` 值是0 的时候，那么需要删除该对象， 当`options.GracePeriod`  不为0的时候，只是更新`DeletionTimestamp`
+
+
+
+另外一个API 更改的地方是`DeleteOptions`， 引入了`OrphanDependents` ，允许用户去表示依赖对象是否应该成为孤立对象。它默认为true，因为在1.2版之前的控制器期望依赖对象成为孤儿。
+
+```go
+type DeleteOptions struct {
+	…
+	OrphanDependents bool
+}
+```
+
+
+
+## 启动GC Controller
+
+从以下启动代码我们可以得知，该controller的启动主要做了两个事情
+
+1. 实例化NewGarbageCollector 
+2. 启动garbage collector
+3. 每30秒定期执行 Sync
+
+```go
+// 代码位置 cmd/kube-controller-manager/app/core.go
+func startGarbageCollectorController(ctx ControllerContext) (http.Handler, bool, error) {
+    // 如果不启动GC Controller，则直接返回退出
+	if !ctx.ComponentConfig.GarbageCollectorController.EnableGarbageCollector {
+		return nil, false, nil
+	}
+
+	gcClientset := ctx.ClientBuilder.ClientOrDie("generic-garbage-collector")
+	discoveryClient := ctx.ClientBuilder.DiscoveryClientOrDie("generic-garbage-collector")
+
+	config := ctx.ClientBuilder.ConfigOrDie("generic-garbage-collector")
+	metadataClient, err := metadata.NewForConfig(config)
+	...
+
+	ignoredResources := make(map[schema.GroupResource]struct{})
+	for _, r := range ctx.ComponentConfig.GarbageCollectorController.GCIgnoredResources {
+		ignoredResources[schema.GroupResource{Group: r.Group, Resource: r.Resource}] = struct{}{}
+	}
+    // 实例化 NewGarbageCollector
+	garbageCollector, err := garbagecollector.NewGarbageCollector(
+		gcClientset,
+		metadataClient,
+		ctx.RESTMapper,
+		ignoredResources,
+		ctx.ObjectOrMetadataInformerFactory,
+		ctx.InformersStarted,
+	)
+	// 启动garbage collector.
+	workers := int(ctx.ComponentConfig.GarbageCollectorController.ConcurrentGCSyncs)
+	go garbageCollector.Run(workers, ctx.Stop)
+
+    // 每30秒定期执行 Sync
+	go garbageCollector.Sync(discoveryClient, 30*time.Second, ctx.Stop)
+
+	return garbagecollector.NewDebugHandler(garbageCollector), true, nil
+}
+```
+
+
+
+### 实例化NewGarbageCollector 
+
+GarbageCollector 的数据结构里面，有两个个队列，分别是
+`attemptToDelete`： 当时机成熟时，垃圾收集器尝试删除队列attemptToDelete中的项。
+`attemptToOrphan`： 垃圾收集器尝试使attemptToOrphan队列中的项的依赖项成为孤儿，然后删除这些项
+
+`dependencyGraphBuilder` 里面也有一个隐藏的队列，那就是`graphChanges`。在介绍 `graphChanges` 这个队列之前我们先理解下`GraphBuilder` 这个Struct的作用。 
+
+`GraphBuilder` 这个Structural其实是使用了Informer监听所有资源的增加删除修改，一旦发现之后会将对象加入`Dirty Queue` 队列。
+
+```go
+func NewGarbageCollector(...) (*GarbageCollector, error) {
+	...
+	attemptToDelete := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "garbage_collector_attempt_to_delete")
+	attemptToOrphan := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "garbage_collector_attempt_to_orphan")
+	absentOwnerCache := NewReferenceCache(500)
+	gc := &GarbageCollector{
+		metadataClient:   metadataClient,
+		restMapper:       mapper,
+		attemptToDelete:  attemptToDelete,
+		attemptToOrphan:  attemptToOrphan,
+		absentOwnerCache: absentOwnerCache,
+	}
+	gc.dependencyGraphBuilder = &GraphBuilder{
+		eventRecorder:    eventRecorder,
+		metadataClient:   metadataClient,
+		informersStarted: informersStarted,
+		restMapper:       mapper,
+		graphChanges:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "garbage_collector_graph_changes"),
+		uidToNode: &concurrentUIDToNode{
+			uidToNode: make(map[types.UID]*node),
+		},
+		attemptToDelete:  attemptToDelete,
+		attemptToOrphan:  attemptToOrphan,
+		absentOwnerCache: absentOwnerCache,
+		sharedInformers:  sharedInformers,
+		ignoredResources: ignoredResources,
+	}
+
+	return gc, nil
+}
+```
+
+
+
+### 启动garbage collector
+
+开启一个新线程执行`dependencyGraphBuilder.Run`
+
+在确保所有的监控都以及存在并且这些监控的controllers HasSynced 函数都返回true
+
+开启一个新的线程**定时每秒**执行 ` runAttemptToDeleteWorker`
+
+开启一个新的线程**定时每秒**执行 `runAttemptToOrphanWorker`
+
+```go
 func (gc *GarbageCollector) Run(workers int, stopCh <-chan struct{}) {
-	// 开启go协程执行dependencyGraphBuilder.Run
-	go gc.dependencyGraphBuilder.Run(stopCh)
+	defer utilruntime.HandleCrash()
+	defer gc.attemptToDelete.ShutDown()
+	defer gc.attemptToOrphan.ShutDown()
+	defer gc.dependencyGraphBuilder.graphChanges.ShutDown()
+
+    // 开启一个新线程执行dependencyGraphBuilder.Run
+    go gc.dependencyGraphBuilder.Run(stopCh)
 
 	if !cache.WaitForNamedCacheSync("garbage collector", stopCh, gc.dependencyGraphBuilder.IsSynced) {
 		return
 	}
-	
+
 	klog.Infof("Garbage collector: all resource monitors have synced. Proceeding to collect garbage")
-	
+
 	// gc workers
 	for i := 0; i < workers; i++ {
-		// 定时执行runAttemptToDeleteWorker和runAttemptToOrphanWorker 方法
 		go wait.Until(gc.runAttemptToDeleteWorker, 1*time.Second, stopCh)
 		go wait.Until(gc.runAttemptToOrphanWorker, 1*time.Second, stopCh)
 	}
-	
+
 	<-stopCh
 }
 
+```
 
 
-# gc.dependencyGraphBuilder.Run
 
+`runAttemptToDeleteWorker` 
 
-func (gb *GraphBuilder) Run(stopCh <-chan struct{}) {	
-	// Set up the stop channel.
-	gb.monitorLock.Lock()
-	gb.stopCh = stopCh
-	gb.running = true
-	gb.monitorLock.Unlock()
+该方法主要是死循环执行 `attemptToDeleteWorker` 函数。工作流程如下：
 
+1. 从`attemptToDelete` 队列获取obj , 最后执行从队列中删除该obj
 
-	// 启动 monitors	 直到stop channel被关闭
-	gb.startMonitors()
-	// 定期执行runProcessGraphChanges
-	wait.Until(gb.runProcessGraphChanges, 1*time.Second, stopCh)
+2. 获取该obj 的node 。 
 
-}
+3. 执行`attemptToDeleteItem`从node 节点中删除该obj。逻辑主要是获取该obj, 获取该obj的ownerreference， 如果没有ownerreference则直接返回。
 
-runProcessGraphChanges是无线死循环执行processGraphChanges
-func (gb *GraphBuilder) runProcessGraphChanges() {
-	for gb.processGraphChanges() {
+   当ownerrefernce 还是存在的时候，这个obj就不会被删除。
+
+4. 判断执行的返回错误
+
+```go
+func (gc *GarbageCollector) runAttemptToDeleteWorker() {
+	for gc.attemptToDeleteWorker() {
 	}
 }
 
-
-runProcessGraphChanges 是从graphChanges队列里面出队，更新graph，填充dirty_queue。
-
-总结：
-gb这个结构体的作用是监控kubernetes中所有资源的各种事件，包括创建、更新、删除，然后将这些事件放入事件队列eventQueue中，然后启动一个worker，这个worker从事件队列eventQueue中取出事件，然后进行处理，处理的目的是维护正确的对象依赖关系。
-
-
-管理队列dirtyQueue:回收控制器会将kubernetes系统中的所有对象都放入这个管理队列中，然后回收控制器会从这个dirtyQueue队列中取出对象，然后进行资源回收处理，资源回收处理的过程是并发运行的，在kube-controller-manager中默认启动5个worker来进行处理。
-在比如当对象存在删除事件时，Propagator会从对象依赖关系中删除这个对象，并且把这个对象所依赖的所有对象都放入dirtyQueue队列中等待处理
-
-
-比如当对象存在创建或者更新事件时，processGraphChanges方法会判断这个对象是否存在所有者，也就是说判断这个对象是否存在Owner，如果存在Owner，并且这个Owner已经不存在了，那么将这个对象放入dirtyQueue队列中等待处理。
-
-
-结构体node通过这个结构体，从Owner的角度出发，可以查询到所有dependent对象
-
-func (gb *GraphBuilder) processGraphChanges() bool {
-	//  从graphChanges 队列中出队，获取队头的对象
-	item, quit := gb.graphChanges.Get()
-	// 获取成功后，将该对象从队列里面移除
-	defer gb.graphChanges.Done(item)
-	// 获取该对象的event， 这个event不是从informer里面直接过来的，是GC controller再次构造了Event信息
-	event, ok := item.(*event)
-	
-	// 获取到event的对象
-	obj := event.obj
-	
-	accessor, err := meta.Accessor(obj)
-	
-	klog.V(5).Infof("GraphBuilder process object: %s/%s, namespace %s, name %s, uid %s, event type %v, virtual=%v", event.gvk.GroupVersion().String(), event.gvk.Kind, accessor.GetNamespace(), accessor.GetName(), string(accessor.GetUID()), event.eventType, event.virtual)	
-	// 检查node是否存在， 这里的node 其实是gb里面的一个数据结构
-	existingNode, found := gb.uidToNode.Read(accessor.GetUID())
-	if found && !event.virtual && !existingNode.isObserved() {
-		// this marks the node as having been observed via an informer event
-		// 1. this depends on graphChanges only containing add/update events from the actual informer
-		// 2. this allows things tracking virtual nodes' existence to stop polling and rely on informer events
-		// identityFromEvent 返回对象的属主OwnerReference
-		observedIdentity := identityFromEvent(event, accessor)
-		if observedIdentity != existingNode.identity {
-			// 找到与我们观察到的身份不匹配的依赖者			
-			_, potentiallyInvalidDependents := partitionDependents(existingNode.getDependents(), observedIdentity)
-			// add those potentially invalid dependents to the attemptToDelete queue.
-			// if their owners are still solid the attemptToDelete will be a no-op.
-			// this covers the bad child -> good parent observation sequence.
-			// the good parent -> bad child observation sequence is handled in addDependentToOwners
-			for _, dep := range potentiallyInvalidDependents {
-				if len(observedIdentity.Namespace) > 0 && dep.identity.Namespace != observedIdentity.Namespace {
-					// Namespace mismatch, this is definitely wrong
-					klog.V(2).Infof("node %s references an owner %s but does not match namespaces", dep.identity, observedIdentity)
-					gb.reportInvalidNamespaceOwnerRef(dep, observedIdentity.UID)
-				}
-				gb.attemptToDelete.Add(dep)
-			}
-	
-			// make a copy (so we don't modify the existing node in place), store the observed identity, and replace the virtual node			
-			klog.V(2).Infof("replacing virtual node %s with observed node %s", existingNode.identity, observedIdentity)
-			existingNode = existingNode.clone()
-			existingNode.identity = observedIdentity
-			gb.uidToNode.Write(existingNode)
-		}
-		existingNode.markObserved()
+func (gc *GarbageCollector) attemptToDeleteWorker() bool {
+	item, quit := gc.attemptToDelete.Get()
+	gc.workerLock.RLock()
+	defer gc.workerLock.RUnlock()
+	if quit {
+		return false
 	}
-	
-	switch {
-	// 注意后面的!found, 也就是一开始gb.uidToNode.Read(accessor.GetUID()) 里面没有找到这个node
-	case (event.eventType == addEvent || event.eventType == updateEvent) && !found:
-		newNode := &node{
-			identity:           identityFromEvent(event, accessor),
-			dependents:         make(map[*node]struct{}),
-			owners:             accessor.GetOwnerReferences(),
-			deletingDependents: beingDeleted(accessor) && hasDeleteDependentsFinalizer(accessor),
-			beingDeleted:       beingDeleted(accessor),
-		}
-		gb.insertNode(newNode)
-		// the underlying delta_fifo may combine a creation and a deletion into
-		// one event, so we need to further process the event.
-		gb.processTransitions(event.oldObj, accessor, newNode)
-	case (event.eventType == addEvent || event.eventType == updateEvent) && found:
-		// handle changes in ownerReferences
-		added, removed, changed := referencesDiffs(existingNode.owners, accessor.GetOwnerReferences())
-		if len(added) != 0 || len(removed) != 0 || len(changed) != 0 {
-			// check if the changed dependency graph unblock owners that are
-			// waiting for the deletion of their dependents.
-			gb.addUnblockedOwnersToDeleteQueue(removed, changed)
-			// update the node itself
-			existingNode.owners = accessor.GetOwnerReferences()
-			// Add the node to its new owners' dependent lists.
-			gb.addDependentToOwners(existingNode, added)
-			// remove the node from the dependent list of node that are no longer in
-			// the node's owners list.
-			gb.removeDependentFromOwners(existingNode, removed)
-		}
-	
-		if beingDeleted(accessor) {
-			existingNode.markBeingDeleted()
-		}
-		gb.processTransitions(event.oldObj, accessor, existingNode)
-	case event.eventType == deleteEvent:
-		if !found {
-			klog.V(5).Infof("%v doesn't exist in the graph, this shouldn't happen", accessor.GetUID())
-			return true
-		}
-	
-		removeExistingNode := true
-	
-		if event.virtual {
-			// this is a virtual delete event, not one observed from an informer
-			deletedIdentity := identityFromEvent(event, accessor)
-			if existingNode.virtual {
-	
-				// our existing node is also virtual, we're not sure of its coordinates.
-				// see if any dependents reference this owner with coordinates other than the one we got a virtual delete event for.
-				if matchingDependents, nonmatchingDependents := partitionDependents(existingNode.getDependents(), deletedIdentity); len(nonmatchingDependents) > 0 {
-	
-					// some of our dependents disagree on our coordinates, so do not remove the existing virtual node from the graph
-					removeExistingNode = false
-	
-					if len(matchingDependents) > 0 {
-						// mark the observed deleted identity as absent
-						gb.absentOwnerCache.Add(deletedIdentity)
-						// attempt to delete dependents that do match the verified deleted identity
-						for _, dep := range matchingDependents {
-							gb.attemptToDelete.Add(dep)
-						}
-					}
-	
-					// if the delete event verified existingNode.identity doesn't exist...
-					if existingNode.identity == deletedIdentity {
-						// find an alternative identity our nonmatching dependents refer to us by
-						replacementIdentity := getAlternateOwnerIdentity(nonmatchingDependents, deletedIdentity)
-						if replacementIdentity != nil {
-							// replace the existing virtual node with a new one with one of our other potential identities
-							replacementNode := existingNode.clone()
-							replacementNode.identity = *replacementIdentity
-							gb.uidToNode.Write(replacementNode)
-							// and add the new virtual node back to the attemptToDelete queue
-							gb.attemptToDelete.AddRateLimited(replacementNode)
-						}
-					}
-				}
-	
-			} else if existingNode.identity != deletedIdentity {
-				// do not remove the existing real node from the graph based on a virtual delete event
-				removeExistingNode = false
-	
-				// our existing node which was observed via informer disagrees with the virtual delete event's coordinates
-				matchingDependents, _ := partitionDependents(existingNode.getDependents(), deletedIdentity)
-	
-				if len(matchingDependents) > 0 {
-					// mark the observed deleted identity as absent
-					gb.absentOwnerCache.Add(deletedIdentity)
-					// attempt to delete dependents that do match the verified deleted identity
-					for _, dep := range matchingDependents {
-						gb.attemptToDelete.Add(dep)
-					}
-				}
-			}
-		}
-	
-		if removeExistingNode {
-			// removeNode updates the graph
-			gb.removeNode(existingNode)
-			existingNode.dependentsLock.RLock()
-			defer existingNode.dependentsLock.RUnlock()
-			if len(existingNode.dependents) > 0 {
-				gb.absentOwnerCache.Add(identityFromEvent(event, accessor))
-			}
-			for dep := range existingNode.dependents {
-				gb.attemptToDelete.Add(dep)
-			}
-			for _, owner := range existingNode.owners {
-				ownerNode, found := gb.uidToNode.Read(owner.UID)
-				if !found || !ownerNode.isDeletingDependents() {
-					continue
-				}
-				// this is to let attempToDeleteItem check if all the owner's
-				// dependents are deleted, if so, the owner will be deleted.
-				gb.attemptToDelete.Add(ownerNode)
-			}
-		}
+	defer gc.attemptToDelete.Done(item)
+	n, ok := item.(*node)
+	...
+
+
+	err := gc.attemptToDeleteItem(n)
+	if err == enqueuedVirtualDeleteEventErr {		
+		return true
+	} else if err == namespacedOwnerOfClusterScopedObjectErr {
+		// a cluster-scoped object referring to a namespaced owner is an error that will not resolve on retry, no need to requeue this node
+		return true
+	} else if err != nil {
+		if _, ok := err.(*restMappingError); ok {			
+			klog.V(5).Infof("error syncing item %s: %v", n, err)
+		} else {
+			utilruntime.HandleError(fmt.Errorf("error syncing item %s: %v", n, err))
+		}		
+		gc.attemptToDelete.AddRateLimited(item)
+	} else if !n.isObserved() {
+		klog.V(5).Infof("item %s hasn't been observed via informer yet", n.identity)
+		gc.attemptToDelete.AddRateLimited(item)
 	}
 	return true
 }
 
+```
 
-runAttemptToDeleteWorker
 
 
-runAttemptToOrphanWorker
+
+
+
+
+### 每30秒定期执行 Sync
+
+```go
+
+```
+
+
+
+
+
+
+
 
 
 
