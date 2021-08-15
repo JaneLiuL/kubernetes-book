@@ -8,7 +8,48 @@
 
 # 概念
 
+namespace 是一个从**逻辑**上划分隔离资源的一个组。使用namespace可以实现一种类似多租户的概念(包括隔离pod/deployment等资源，不同namespace不同权限，限制不同资源的quota等)
+
 在Kubernetes中，我们会使用namespace来实现多个虚拟集群。在namespace中，资源的名称是唯一的。但是并非所有资源对象都是属于namespace scope的，例如PV。
+
+# 数据结构
+
+一个Namespace的name必须是DNS 兼容的标签；
+
+一个Namepsace必须先创建，然后存在该namespace的资源例如pod才能被创建。
+
+
+
+```go
+type Namespace struct {
+  TypeMeta   `json:",inline"`
+  ObjectMeta `json:"metadata,omitempty"`
+
+  Spec NamespaceSpec `json:"spec,omitempty"`
+  Status NamespaceStatus `json:"status,omitempty"`
+}
+```
+
+## Phases
+
+Namespace有两种Phase， 默认是Active， 只有当namespace.ObjectMeta.DeletionTimestamp不为空的时候Phase就变成Terminating。
+
+Active: 当一个Namespace被创建的时候，就默认是Active状态。
+
+Terminating: 当该Namespace被执行了DELETE request的时候，` namespace.ObjectMeta.DeletionTimestamp` 就会被置为当前时间，然后`Namespace.Status.Phase` 则被置为Terminating.
+
+```go
+type NamespacePhase string
+const(
+  NamespaceActive NamespacePhase = "Active"
+  NamespaceTerminating NamespacePhase = "Terminating"
+)
+
+type NamespaceStatus struct { 
+  ...
+  Phase NamespacePhase 
+}
+```
 
 
 
