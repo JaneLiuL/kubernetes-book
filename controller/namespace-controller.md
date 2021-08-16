@@ -51,7 +51,18 @@ type NamespaceStatus struct {
 }
 ```
 
+# REST API
 
+操作Namespace的API
+
+| Action   | HTTP Verb | Path                                           | Description                    |
+| -------- | --------- | ---------------------------------------------- | ------------------------------ |
+| CREATE   | POST      | /api/{version}/namespaces                      | Create a namespace             |
+| LIST     | GET       | /api/{version}/namespaces                      | List all namespaces            |
+| UPDATE   | PUT       | /api/{version}/namespaces/{namespace}          | Update namespace {namespace}   |
+| DELETE   | DELETE    | /api/{version}/namespaces/{namespace}          | Delete namespace {namespace}   |
+| FINALIZE | PUT       | /api/{version}/namespaces/{namespace}/finalize | Finalize namespace {namespace} |
+| WATCH    | GET       | /api/{version}/watch/namespaces                | Watch all namespaces           |
 
 # 实例化Namespace Controller
 
