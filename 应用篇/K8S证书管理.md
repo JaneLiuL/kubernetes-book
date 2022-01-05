@@ -43,6 +43,184 @@ Nginx-ingress
 
 
 
+#### EKS 权限
+
+在部署完成EKS 之后，还需要在EKS里面创建以下role并且把role attach到EKS使用的policy中
+
+```
+inputs = {
+  environment             = local.environment
+  cluster_oidc_issuer_url = dependency.eks.outputs.ekscluster_output.identity.0.oidc.0.issuer
+
+  roles = {
+    cert-manager = {
+      namespace      = "xx-platform"
+      description    = "Role and policy for certmanager"
+      serviceaccount = "xx-cert-manager"
+      policy = [
+        {
+          "sid" : "allowgetchange"
+          "actions" : ["route53:GetChange"],
+          "effect" : "Allow",
+          "resources" : ["arn:aws:route53:::change/*"]
+        },
+        {
+          "sid" : "allowlisthostedzones"
+          "actions" : ["route53:ListHostedZonesByName"],
+          "effect" : "Allow",
+          "resources" : ["*"]
+        },
+        {
+          "sid" : "allowchangerecordsets"
+          "actions" : ["route53:ChangeResourceRecordSets"],
+          "effect" : "Allow",
+          "resources" : ["arn:aws:route53:::hostedzone/*"]
+        }
+      ]
+    }
+    external-dns-private = {
+      namespace      = "xx-platform"
+      description    = "Role and policy for External DNS Private"
+      serviceaccount = "external-dns-private"
+      policy = [
+        {
+          "sid" : "allowgetchange"
+          "actions" : ["route53:ChangeResourceRecordSets"],
+          "effect" : "Allow",
+          "resources" : ["arn:aws:route53:::hostedzone/*"]
+        },
+        {
+          "sid" : "allowlisthostedzones"
+          "actions" : ["route53:ListHostedZones",
+          "route53:ListResourceRecordSets"],
+          "effect" : "Allow",
+          "resources" : ["*"]
+        }
+      ]
+    }
+    external-dns-central = {
+      namespace      = "xx-platform"
+      description    = "Role and policy for External DNS Central"
+      serviceaccount = "external-dns-central"
+      policy = [
+        {
+          "sid" : "allowgetchange"
+          "actions" : ["route53:ChangeResourceRecordSets"],
+          "effect" : "Allow",
+          "resources" : ["arn:aws:route53:::hostedzone/*"]
+        },
+        {
+          "sid" : "allowlisthostedzones"
+          "actions" : ["route53:ListHostedZones",
+          "route53:ListResourceRecordSets"],
+          "effect" : "Allow",
+          "resources" : ["*"]
+        }
+      ]
+    }
+    ecr-operator = {
+      namespace      = "xx-platform"
+      description    = "Role and policy required by ecr operator to create ecr credentials to be used by flux/helm operator"
+      serviceaccount = "ecr-operator"
+      policy = [
+        {
+          "sid" : "allowOperatorAccesstoECR",
+          "effect" : "Allow",
+          "actions" : [
+            "ecr:GetAuthorizationToken",
+            "ecr:BatchCheckLayerAvailability",
+            "ecr:GetDownloadUrlForLayer",
+            "ecr:GetRepositoryPolicy",
+            "ecr:DescribeRepositories",
+            "ecr:ListImages",
+            "ecr:DescribeImages",
+            "ecr:BatchGetImage",
+            "ecr:ListTagsForResource"
+          ],
+          "resources" : ["arn:aws:ecr:*"]
+        }
+      ]
+    }
+  }
+}
+```
+
+
+
+如下所示，上面的terragrunt调取下面的terraform 
+
+```terraform
+locals {
+  oidc_provider    = replace(var.cluster_oidc_issuer_url, "https://", "")
+  arn              = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}"
+  policy_principal = "${local.arn}:oidc-provider/${local.oidc_provider}"
+  annotations      = [for k, v in var.roles : "eks.amazonaws.com/role-arn: ${local.arn}:role/${var.environment}-${k}-${v.namespace}"]
+}
+
+data "aws_caller_identity" "current" {}
+
+data "aws_iam_policy_document" "self" {
+  for_each = var.roles
+  dynamic "statement" {
+    for_each = [for p in each.value.policy : {
+      sid       = p.sid
+      effect    = p.effect
+      resources = p.resources
+      actions   = p.actions
+    }]
+
+    content {
+      sid       = statement.value.sid
+      effect    = statement.value.effect
+      resources = statement.value.resources
+      actions   = statement.value.actions
+    }
+  }
+}
+
+data "aws_partition" "current" {}
+
+resource "aws_iam_policy" "self" {
+  for_each    = var.roles
+  name_prefix = "${var.environment}-${each.key}-${each.value.namespace}"
+  description = each.value.description
+  policy      = data.aws_iam_policy_document.self[each.key].json
+}
+
+resource "aws_iam_role" "self" {
+  for_each           = var.roles
+  name               = "${var.environment}-${each.key}-${each.value.namespace}"
+  assume_role_policy = <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "${local.policy_principal}"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "${local.oidc_provider}:sub": "system:serviceaccount:${each.value.namespace}:${each.value.serviceaccount}"
+                }
+            }
+        }
+    ]
+}
+    EOF
+  tags               = var.resource_tags
+}
+
+resource "aws_iam_role_policy_attachment" "self" {
+  for_each   = var.roles
+  policy_arn = aws_iam_policy.self[each.key].arn
+  role       = aws_iam_role.self[each.key].name
+}
+```
+
+
+
 ## 组件流程
 
 1. External-dns 在AWS DNS zone创建DNS record
