@@ -8,7 +8,7 @@ Cert-manager是一个在Kubernetes 集群中提供证书的控制器。然后它
 
 External DNS
 
-`ExternalDNS`运行在集群中，在AWS DNS中创建DNS记录。根据云提供商的不同例如AWS Route53。它可以监视`Ingress `资源以及带注释的LoadBalancer Service和 自动为相应的endpoint 创建DNS记录的入口控制器通过Layer 7路由，所以它是可能的在本地计算机上配置主机名并将其指向入口控制器服务，这是一个繁琐和复杂的的过程。ExternalDNS自动化此过程。
+`ExternalDNS`运行在集群中，在AWS DNS中创建DNS记录。根据云提供商的不同例如AWS Route53。它可以监视`Ingress `资源以及带注释的LoadBalancer Service和 自动为相应的endpoint 创建DNS记录的入口控制器通过七层路由，所以它是可能的在本地计算机上配置主机名并将其指向入口控制器服务，这是一个繁琐和复杂的的过程。ExternalDNS自动化此过程。
 
 Nginx-ingress
 
@@ -39,7 +39,114 @@ Nginx-ingress
 
 ## 部署
 
+所有在组件里面提到的基本遵守官网的安装即可，值得注意或者修改的我基本都写下来了
 
+#### Nginx-ingress
+
+```yaml
+# nginx-ingress可以安装多个，然后设置不同的Class
+ingressClass: private
+# service我们设置成LoadBalancer， 并且加上aws的anntation
+      service:
+        type: LoadBalancer
+        annotations:
+           service.beta.kubernetes.io/aws-load-balancer-internal: "true"
+           service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+```
+
+
+
+#### External dns
+
+```yaml
+# 选择对service以及ingress 资源类型的监听
+    sources:
+      - service
+      - ingress
+# 云平台以及对应的domainFilters（也就是ingress host里面的域名如果命中则去route53创建A记录）
+    provider: aws
+    txtOwnerId: internal-dns
+    ignoreHostnameAnnotation: false
+    domainFilters:
+      - ${BASE_DOMAIN}
+    aws:
+      region: ${REGION}
+      zoneType: private
+  #assumeRoleArn:
+    affinity: {}
+    policy: upsert-only
+    registry: "txt"
+
+# 创建serviceaccount，并且annotation带上我们的EKS权限
+    serviceAccount:
+      create: true
+      name: external-dns-private
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ENVIRONMENT_NAME}-external-dns-private-xx-platform"
+```
+
+
+
+#### Cert-manager
+
+```yaml
+# 创建serviceaccount，并且annotation带上我们的EKS权限
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ENVIRONMENT_NAME}-cert-manager-xx-platform"
+# 安装对应的组件
+    cainjector:
+      image:
+        repository: jetstack/cert-manager-cainjector
+        tag: v1.6.0
+    webhook:
+      hostNetwork: true
+      securePort: 10251
+      image:
+        repository: jetstack/cert-manager-webhook
+        tag: v1.6.0
+    startupapicheck:
+      image:
+        repository: jetstack/cert-manager-ctl
+        tag: v1.6.0
+    extraArgs: ["--dns01-recursive-nameservers=8.8.8.8:53,1.1.1.1:53"]
+```
+
+clusterissuer
+
+这里我们创建两个clusterissuer， 一个是自签的，一个是使用let's encrypt 签发的证书
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: cert-manager-self-signing
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: cluster-issuer-awsroute53
+spec:
+  acme:
+    # You must replace this email address with your own.
+    # Let's Encrypt will use this to contact you about expiring
+    # certificates, and issues related to your account.
+    email: ${EMAIL_FOR_CLUSTERISSUER}
+    server: "https://acme-v02.api.letsencrypt.org/directory"
+    #server: ${ACME_SERVER_URL}
+    privateKeySecretRef:
+      # Secret resource that will be used to store the account's private key.
+      name: cluster-issuer-awsroute53-account-key
+    solvers:
+      - selector:
+          dnsZones:
+            - "${BASE_DOMAIN}"
+        dns01:
+          route53:
+            region: ${REGION}
+```
 
 
 
