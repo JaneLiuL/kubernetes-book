@@ -2,15 +2,26 @@
 
 这篇文档主要是讲解如何在Kubernetes 集群中签证书。（赶工，还不是因为要交接）
 
-Cert-manager:
+#### Cert-manager
 
 Cert-manager是一个在Kubernetes 集群中提供证书的控制器。然后它将这些证书请求发送到`Let'sEncrypt` API服务器进行签名。这将生成一个Kubernetes `Secret`形式的签名证书。
 
-External DNS
+接口
+
+Ingress资源自动生成证书时，使用如下注解:
+
+```yaml
+annotation:
+  cert-manager.io/cluster-issuer: <reference-to-ClusterIssuer>
+```
+
+
+
+#### External DNS
 
 `ExternalDNS`运行在集群中，在AWS DNS中创建DNS记录。根据云提供商的不同例如AWS Route53。它可以监视`Ingress `资源以及带注释的LoadBalancer Service和 自动为相应的endpoint 创建DNS记录的入口控制器通过七层路由，所以它是可能的在本地计算机上配置主机名并将其指向入口控制器服务，这是一个繁琐和复杂的的过程。ExternalDNS自动化此过程。
 
-Nginx-ingress
+#### Nginx-ingress
 
 运行在Kubernets集群内部的容器可以通过Pod to Service通信相互通信。Kubernetes中使用一个入口控制器，以一种简单的方式将集群内的服务公开给集群外的客户端。nginx-ingress是我们使用的入口控制器。每个入口控制器需要一个LoadBalancer服务，该服务将给它一个集群外的ip。流量通过负载均衡器流向集群内部的入口控制器实例，然后流量被第7层路由到正确的pod。
 
@@ -42,6 +53,8 @@ Nginx-ingress
 所有在组件里面提到的基本遵守官网的安装即可，值得注意或者修改的我基本都写下来了
 
 #### Nginx-ingress
+
+除了对以下更改，我们还对nginx template进行了修改，看附录1
 
 ```yaml
 # nginx-ingress可以安装多个，然后设置不同的Class
@@ -88,6 +101,8 @@ ingressClass: private
 
 
 #### Cert-manager
+
+Cert-manager 使用 Helm chart安装
 
 ```yaml
 # 创建serviceaccount，并且annotation带上我们的EKS权限
@@ -150,11 +165,13 @@ spec:
 
 
 
+
+
 #### EKS 权限
 
 在部署完成EKS 之后，还需要在EKS里面创建以下role并且把role attach到EKS使用的policy中
 
-```
+```terraform
 inputs = {
   environment             = local.environment
   cluster_oidc_issuer_url = dependency.eks.outputs.ekscluster_output.identity.0.oidc.0.issuer
@@ -343,3 +360,324 @@ resource "aws_iam_role_policy_attachment" "self" {
 用户看到的排查图
 
 ![](./images/用户排查图.png)
+
+
+
+当我们的ingress资源，如下例子所示，加上annotation `cert-manager.io/cluster-issuer: cluster-issuer-awsroute53`之后并且添加tls-- secretName之后
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: cluster-issuer-awsroute53
+  name: xx-external
+spec:
+  ingressClassName: private
+  rules:
+  - host: aa.xx.xx.net
+    http:
+      paths:
+      - backend:
+          service:
+            name: xx-external-http
+            port:
+              name: http
+        path: /
+        pathType: ImplementationSpecific
+  tls:
+  - hosts:
+    - aa.xx.xx.net
+    secretName: keycloak-tls
+```
+
+同时，external-dns会使用domain filter发现ingress的host 命中domain之后，在route53创建A记录以及TXT 记录
+
+![](./images/external-dns-A-record.png)
+
+
+
+然后nginx ingress controller 会在同一个namespace创建以下certificate
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: xx-tls
+  ownerReferences:
+  - apiVersion: networking.k8s.io/v1
+    blockOwnerDeletion: true
+    controller: true
+    kind: Ingress
+    name: xx-external
+    uid: eea9510e-4332-4ba0-80e7-66c8e8c6e813
+spec:
+  dnsNames:
+  - aa.xx.xx.net
+  issuerRef:
+    group: cert-manager.io
+    kind: ClusterIssuer
+    name: cluster-issuer-awsroute53
+  secretName: xx-tls
+  usages:
+  - digital signature
+  - key encipherment
+```
+
+接下来，我们需要观察cert-manager是否把我们ingress 指定tls的secret创建并且填充证书
+
+![](./images/secret-cert.png)
+
+
+
+
+
+## 常见问题
+
+证书没有签发下来
+
+
+
+## 用户如何创建ingress
+
+要使用patch..
+
+```
+
+```
+
+
+
+## 附录1
+
+我们使用kustomize对nginx template进行了以下修改，这是有原因的，前阵子的log4j的漏洞
+
+```yaml
+    - op: replace
+      path: /spec/values/controller/config/entries
+      value:
+        http-snippets: |
+          map $http_x_request_id $req_id {
+            default   $http_x_request_id;
+            ""        $request_id;
+          }
+        location-snippets: |
+          proxy_set_header      X-Request-Id $req_id;
+        ingress-template: |
+          # configuration for {{.Ingress.Namespace}}/{{.Ingress.Name}}
+
+          {{range $upstream := .Upstreams}}
+          upstream {{$upstream.Name}} {
+          	{{if ne $upstream.UpstreamZoneSize "0"}}zone {{$upstream.Name}} {{$upstream.UpstreamZoneSize}};{{end}}
+          	{{if $upstream.LBMethod }}{{$upstream.LBMethod}};{{end}}
+          	{{range $server := $upstream.UpstreamServers}}
+          	server {{$server.Address}}:{{$server.Port}} max_fails={{$server.MaxFails}} fail_timeout={{$server.FailTimeout}} max_conns={{$server.MaxConns}};{{end}}
+          	{{if $.Keepalive}}keepalive {{$.Keepalive}};{{end}}
+          }{{end}}
+
+          {{range $server := .Servers}}
+          server {
+            {{if (index $.Ingress.Annotations "custom.nginx.org/allowed-ips")}}
+            {{range $ip := split (index $.Ingress.Annotations "custom.nginx.org/allowed-ips") ","}}
+          	allow {{trim $ip}};
+            {{end}}
+          	deny all;
+            {{end}}
+
+          	{{if not $server.GRPCOnly}}
+          	{{range $port := $server.Ports}}
+          	listen {{$port}}{{if $server.ProxyProtocol}} proxy_protocol{{end}};
+          	{{- end}}
+          	{{end}}
+
+          	{{if $server.SSL}}
+          	{{if $server.TLSPassthrough}}
+          	listen unix:/var/lib/nginx/passthrough-https.sock ssl{{if $server.HTTP2}} http2{{end}} proxy_protocol;
+          	set_real_ip_from unix:;
+          	real_ip_header proxy_protocol;
+          	{{else}}
+          	{{- range $port := $server.SSLPorts}}
+          	listen {{$port}} ssl{{if $server.HTTP2}} http2{{end}}{{if $server.ProxyProtocol}} proxy_protocol{{end}};
+          	{{- end}}
+          	{{end}}
+          	ssl_certificate {{$server.SSLCertificate}};
+          	ssl_certificate_key {{$server.SSLCertificateKey}};
+          	{{if $server.SSLCiphers}}
+          	ssl_ciphers {{$server.SSLCiphers}};
+          	{{end}}
+          	{{end}}
+
+          	{{range $setRealIPFrom := $server.SetRealIPFrom}}
+          	set_real_ip_from {{$setRealIPFrom}};{{end}}
+          	{{if $server.RealIPHeader}}real_ip_header {{$server.RealIPHeader}};{{end}}
+          	{{if $server.RealIPRecursive}}real_ip_recursive on;{{end}}
+
+          	server_tokens {{$server.ServerTokens}};
+
+          	server_name {{$server.Name}};
+
+          	{{range $proxyHideHeader := $server.ProxyHideHeaders}}
+          	proxy_hide_header {{$proxyHideHeader}};{{end}}
+          	{{range $proxyPassHeader := $server.ProxyPassHeaders}}
+          	proxy_pass_header {{$proxyPassHeader}};{{end}}
+
+          	{{- if and $server.HSTS (or $server.SSL $server.HSTSBehindProxy)}}
+          	set $hsts_header_val "";
+          	proxy_hide_header Strict-Transport-Security;
+          	{{- if $server.HSTSBehindProxy}}
+          	if ($http_x_forwarded_proto = 'https') {
+          	{{else}}
+          	if ($https = on) {
+          	{{- end}}
+          		set $hsts_header_val "max-age={{$server.HSTSMaxAge}}; {{if $server.HSTSIncludeSubdomains}}includeSubDomains; {{end}}preload";
+          	}
+
+          	add_header Strict-Transport-Security "$hsts_header_val" always;
+          	{{end}}
+
+          	{{if $server.SSL}}
+          	{{if not $server.GRPCOnly}}
+          	{{- if $server.SSLRedirect}}
+          	if ($scheme = http) {
+          		return 301 https://$host:{{index $server.SSLPorts 0}}$request_uri;
+          	}
+          	{{- end}}
+          	{{end}}
+          	{{- end}}
+
+          	{{- if $server.RedirectToHTTPS}}
+          	if ($http_x_forwarded_proto = 'http') {
+          		return 301 https://$host$request_uri;
+          	}
+          	{{- end}}
+
+          	{{- if $server.ServerSnippets}}
+          	{{range $value := $server.ServerSnippets}}
+          	{{$value}}{{end}}
+          	{{- end}}
+
+          	{{range $location := $server.Locations}}
+          	location {{$location.Path}} {
+          		{{with $location.MinionIngress}}
+          		# location for minion {{$location.MinionIngress.Namespace}}/{{$location.MinionIngress.Name}}
+          		{{end}}
+          		{{if $location.GRPC}}
+          		{{if not $server.GRPCOnly}}
+          		error_page 400 @grpcerror400;
+          		error_page 401 @grpcerror401;
+          		error_page 403 @grpcerror403;
+          		error_page 404 @grpcerror404;
+          		error_page 405 @grpcerror405;
+          		error_page 408 @grpcerror408;
+          		error_page 414 @grpcerror414;
+          		error_page 426 @grpcerror426;
+          		error_page 500 @grpcerror500;
+          		error_page 501 @grpcerror501;
+          		error_page 502 @grpcerror502;
+          		error_page 503 @grpcerror503;
+          		error_page 504 @grpcerror504;
+          		{{end}}
+
+          		{{- if $location.LocationSnippets}}
+          		{{range $value := $location.LocationSnippets}}
+          		{{$value}}{{end}}
+          		{{- end}}
+
+          		grpc_connect_timeout {{$location.ProxyConnectTimeout}};
+          		grpc_read_timeout {{$location.ProxyReadTimeout}};
+          		grpc_send_timeout {{$location.ProxySendTimeout}};
+          		grpc_set_header Host $host;
+          		grpc_set_header X-Real-IP $remote_addr;
+          		grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          		grpc_set_header X-Forwarded-Host $host;
+          		grpc_set_header X-Forwarded-Port $server_port;
+          		grpc_set_header X-Forwarded-Proto {{if $server.RedirectToHTTPS}}https{{else}}$scheme{{end}};
+
+          		{{- if $location.ProxyBufferSize}}
+          		grpc_buffer_size {{$location.ProxyBufferSize}};
+          		{{- end}}
+          		{{if $location.SSL}}
+          		grpc_pass grpcs://{{$location.Upstream.Name}}{{$location.Rewrite}};
+          		{{else}}
+          		grpc_pass grpc://{{$location.Upstream.Name}}{{$location.Rewrite}};
+          		{{end}}
+          		{{else}}
+          		proxy_http_version 1.1;
+          		{{if $location.Websocket}}
+          		proxy_set_header Upgrade $http_upgrade;
+          		proxy_set_header Connection $connection_upgrade;
+          		{{- else}}
+          		{{- if $.Keepalive}}proxy_set_header Connection "";{{end}}
+          		{{- end}}
+
+          		{{- if $location.LocationSnippets}}
+          		{{range $value := $location.LocationSnippets}}
+          		{{$value}}{{end}}
+          		{{- end}}
+
+          		proxy_connect_timeout {{$location.ProxyConnectTimeout}};
+          		proxy_read_timeout {{$location.ProxyReadTimeout}};
+          		proxy_send_timeout {{$location.ProxySendTimeout}};
+          		client_max_body_size {{$location.ClientMaxBodySize}};
+          		proxy_set_header Host $host;
+          		proxy_set_header X-Real-IP $remote_addr;
+          		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          		proxy_set_header X-Forwarded-Host $host;
+          		proxy_set_header X-Forwarded-Port $server_port;
+          		proxy_set_header X-Forwarded-Proto {{if $server.RedirectToHTTPS}}https{{else}}$scheme{{end}};
+          		proxy_buffering {{if $location.ProxyBuffering}}on{{else}}off{{end}};
+
+          		{{- if $location.ProxyBuffers}}
+          		proxy_buffers {{$location.ProxyBuffers}};
+          		{{- end}}
+          		{{- if $location.ProxyBufferSize}}
+          		proxy_buffer_size {{$location.ProxyBufferSize}};
+          		{{- end}}
+          		{{- if $location.ProxyMaxTempFileSize}}
+          		proxy_max_temp_file_size {{$location.ProxyMaxTempFileSize}};
+          		{{- end}}
+          		{{if $location.SSL}}
+          		proxy_pass https://{{$location.Upstream.Name}}{{$location.Rewrite}};
+          		{{else}}
+          		proxy_pass http://{{$location.Upstream.Name}}{{$location.Rewrite}};
+          		{{end}}
+          		{{end}}
+          	}{{end}}
+          	{{if $server.GRPCOnly}}
+          	error_page 400 @grpcerror400;
+          	error_page 401 @grpcerror401;
+          	error_page 403 @grpcerror403;
+          	error_page 404 @grpcerror404;
+          	error_page 405 @grpcerror405;
+          	error_page 408 @grpcerror408;
+          	error_page 414 @grpcerror414;
+          	error_page 426 @grpcerror426;
+          	error_page 500 @grpcerror500;
+          	error_page 501 @grpcerror501;
+          	error_page 502 @grpcerror502;
+          	error_page 503 @grpcerror503;
+          	error_page 504 @grpcerror504;
+          	{{end}}
+          	{{if $server.HTTP2}}
+          	location @grpcerror400 { default_type application/grpc; return 400 "\n"; }
+          	location @grpcerror401 { default_type application/grpc; return 401 "\n"; }
+          	location @grpcerror403 { default_type application/grpc; return 403 "\n"; }
+          	location @grpcerror404 { default_type application/grpc; return 404 "\n"; }
+          	location @grpcerror405 { default_type application/grpc; return 405 "\n"; }
+          	location @grpcerror408 { default_type application/grpc; return 408 "\n"; }
+          	location @grpcerror414 { default_type application/grpc; return 414 "\n"; }
+          	location @grpcerror426 { default_type application/grpc; return 426 "\n"; }
+          	location @grpcerror500 { default_type application/grpc; return 500 "\n"; }
+          	location @grpcerror501 { default_type application/grpc; return 501 "\n"; }
+          	location @grpcerror502 { default_type application/grpc; return 502 "\n"; }
+          	location @grpcerror503 { default_type application/grpc; return 503 "\n"; }
+          	location @grpcerror504 { default_type application/grpc; return 504 "\n"; }
+          	{{end}}
+          }{{end}}
+
+```
+
+
+
+
+
