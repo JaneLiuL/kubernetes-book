@@ -191,6 +191,8 @@ func (ll *LeaseLock) Update(ctx context.Context, ler LeaderElectionRecord) error
 ### scheduler Run 
 位置 https://github.com/kubernetes/kubernetes/blob/release-1.25/cmd/kube-scheduler/app/server.go#L146
 首先scheduler 在通过启动参数，构建了cc这个对象，如果启动了leader election, 他就开始进入构建 leaderElector对象，并且通过`leaderElector.Run(ctx)` 来开始进入选举
+此方法负责运行领导者选举循环。它首先尝试获取锁（使用 le.acquire）。成功后，它会运行我们之前配置的 OnStartedLeading 回调并定期更新租约。如果获取锁失败，它只会运行 OnStoppedLeading 回调并返回。
+
 ```go
 func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *scheduler.Scheduler) error {
 	// remove some useless logic here...
@@ -233,7 +235,7 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 
 ```
 现在我们来看看 `leaderElector.Run(ctx)` 发生了什么事情
-`acquire` 会call `tryAcquireOrRenew` 来判断是否获取锁或者renew成功，这是最关键的一个函数， The leader must update lease time before lease duration is expired， if 
+acquire 和 renew 方法实现中最重要的部分是对 tryAcquireOrRenew 的调用，它包含锁定机制的核心逻辑。
 
 总结一下大概流程如下
 * tryAcquireOrRenew 函数尝试获取租约
@@ -381,3 +383,6 @@ Q: 为什么只有一个master node的时候，也要默认开启leader
 
 # summary
 Kubernetes 中的leader 选举过程很简单。它从创建一个锁对象开始，leader定期更新当前时间戳，以此作为通知其他副本其领导地位的一种方式。这个锁对象可以是 Lease 、 ConfigMap 或 Endpoint ，也持有当前领导者的身份。如果领导者未能在给定的时间间隔内更新时间戳，则认为它已经崩溃，这是当不活动的副本通过使用其身份更新锁来竞相获得领导权时。成功获取锁的 pod 将成为新的领导者。
+
+说句题外话：
+其实kubernetes leader election 里面使用的lease 锁还是很明显的乐观锁的，他是用kubernetes 操作的原子性来确保没有两个副本可以同时获得租约（否则可能导致竞争条件和其他意外行为！）。每当 Lease 更新（更新或获取）时，其上的 resourceVersion 字段也会由 Kubernetes 更新。当另一个进程尝试同时更新 Lease 时，Kubernetes 会检查更新对象的 resourceVersion 字段是否与当前对象匹配——如果不匹配，则更新失败，从而防止并发问题！
