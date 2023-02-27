@@ -226,7 +226,22 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 }
 
 ```
-现在我们来看看 `leaderElector.Run(ctx)` 发生了什么事情， 会先判断是否获得锁， 如果
+现在我们来看看 `leaderElector.Run(ctx)` 发生了什么事情
+`acquire` 会call `tryAcquireOrRenew` 来判断是否获取锁或者renew成功，这是最关键的一个函数
+总结一下大概流程如下
+* tryAcquireOrRenew 函数尝试获取租约
+    * 获取不到 lease,并且 错误是找不到这个名字的lease，那么就尝试 create lease， 开始创建租约
+    * 如果获取lease有其他错误，那么返回 false，不再继续下面的逻辑
+* 如果创建租约成功，或者获取到租约的情况下，检查租约的 Identity & Time
+    * 更新本地缓存的租约，并更新观察时间戳，用来判断租约是否到期
+        * leader 的租约尚未到期，自己暂时不能抢占它，函数返回 false
+    * 租约到期，而 leader 身份不变，因此获得租约的时间戳 AcquireTime 保持不变
+    * 租约到期，leader 易主，transtions+1 说明 leader 更替了
+    * 尝试去更新租约记录
+        * 更新失败，函数返回 false
+        * 更新成功，函数返回 true
+* 函数返回 True 说明本 goroutine 已成功抢占到锁，获得租约合同，成为 leader。
+
 
 ```go
 // Run starts the leader election loop. Run will not return
@@ -283,12 +298,15 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 	}
 
 	// 1. obtain or create the ElectionRecord
+    //  这个也就是上面 lease get的方法实现
 	oldLeaderElectionRecord, oldLeaderElectionRawRecord, err := le.config.Lock.Get(ctx)
 	if err != nil {
+        //  如果 是获取不到 lease的其他错误, 那么返回false
 		if !errors.IsNotFound(err) {
 			klog.Errorf("error retrieving resource lock %v: %v", le.config.Lock.Describe(), err)
 			return false
 		}
+        //  能进入这里，说获取不到 lease，那么就尝试 create lease
 		if err = le.config.Lock.Create(ctx, leaderElectionRecord); err != nil {
 			klog.Errorf("error initially creating leader election record: %v", err)
 			return false
@@ -298,13 +316,16 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 
 		return true
 	}
-
+    //  如果创建租约成功，或者获取到租约的情况下
 	// 2. Record obtained, check the Identity & Time
+    //  更新本地缓存的租约，并更新观察时间戳，用来判断租约是否到期
 	if !bytes.Equal(le.observedRawRecord, oldLeaderElectionRawRecord) {
 		le.setObservedRecord(oldLeaderElectionRecord)
 
 		le.observedRawRecord = oldLeaderElectionRawRecord
 	}
+
+    // leader 的租约尚未到期，自己暂时不能抢占它，函数返回 false
 	if len(oldLeaderElectionRecord.HolderIdentity) > 0 &&
 		le.observedTime.Add(le.config.LeaseDuration).After(now.Time) &&
 		!le.IsLeader() {
@@ -314,19 +335,22 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 
 	// 3. We're going to try to update. The leaderElectionRecord is set to it's default
 	// here. Let's correct it before updating.
+     // 3. 租约到期，而 leader 身份不变，因此获得租约的时间戳 AcquireTime 保持不变
 	if le.IsLeader() {
 		leaderElectionRecord.AcquireTime = oldLeaderElectionRecord.AcquireTime
 		leaderElectionRecord.LeaderTransitions = oldLeaderElectionRecord.LeaderTransitions
 	} else {
+        //  // 租约到期，leader 易主，transtions+1 说明 leader 更替了
 		leaderElectionRecord.LeaderTransitions = oldLeaderElectionRecord.LeaderTransitions + 1
 	}
 
 	// update the lock itself
+    //  // 尝试去更新租约记录， 
 	if err = le.config.Lock.Update(ctx, leaderElectionRecord); err != nil {
 		klog.Errorf("Failed to update lock: %v", err)
 		return false
 	}
-
+   // 更新成功，函数返回 true
 	le.setObservedRecord(&leaderElectionRecord)
 	return true
 }
