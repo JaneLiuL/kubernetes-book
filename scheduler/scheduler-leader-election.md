@@ -3,6 +3,12 @@
 scheduler这个组件是有leader选举的，并且是不使用etcd来实现leader election.
 
 
+# background & introduction
+近年来，随着对可靠系统和基础设施的需求增加，“高可用性”一词越来越受欢迎。在分布式系统中，高可用性通常涉及最大化正常运行时间和使系统容错。高可用性中常见的做法是使用冗余来最大程度地减少单点故障。为冗余准备您的系统和服务可能就像在负载均衡器后面**部署更多副本**一样简单。尽管这样的配置适用于许多应用程序，但某些用例需要在副本之间进行**协调**才能使系统正常工作。
+
+一个很好的例子是将 Kubernetes scheduler /  controller mgmt 部署为多个实例。为了防止任何意外行为，leader选举过程必须确保在副本中选出一名领导者，并且是唯一主动协调集群的人。其他实例应保持不活动状态，但准备好在领导实例发生故障时接管。
+
+
 # 探索&&问题
 之前使用kubespray provision了一个ha cluster, 是2个node 来作为master node, 3个worker node。 
 我一直以为两个master node的scheduler 是独立运行，没有哪个为leader的时候，我看了一下scheduler pod的日志，大概如下所示
@@ -227,7 +233,8 @@ func Run(ctx context.Context, cc *schedulerserverconfig.CompletedConfig, sched *
 
 ```
 现在我们来看看 `leaderElector.Run(ctx)` 发生了什么事情
-`acquire` 会call `tryAcquireOrRenew` 来判断是否获取锁或者renew成功，这是最关键的一个函数
+`acquire` 会call `tryAcquireOrRenew` 来判断是否获取锁或者renew成功，这是最关键的一个函数， The leader must update lease time before lease duration is expired， if 
+
 总结一下大概流程如下
 * tryAcquireOrRenew 函数尝试获取租约
     * 获取不到 lease,并且 错误是找不到这个名字的lease，那么就尝试 create lease， 开始创建租约
@@ -306,7 +313,7 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 			klog.Errorf("error retrieving resource lock %v: %v", le.config.Lock.Describe(), err)
 			return false
 		}
-        //  能进入这里，说获取不到 lease，那么就尝试 create lease
+        //  能进入这里，说lease 404，那么就尝试 create lease
 		if err = le.config.Lock.Create(ctx, leaderElectionRecord); err != nil {
 			klog.Errorf("error initially creating leader election record: %v", err)
 			return false
@@ -357,7 +364,20 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 
 ```
 
-## 一开始怎么判断谁是leader
-# Q1: 另外一个master 的scheduler是在什么情况下怎么获取leader的
-# Q2: why use lease instead of endpoint
-# Q3: 为什么只有一个master node的时候，也要默认开启leader
+# 解答我们的问题
+Q:  一开始怎么判断谁是leader
+一开始，不需要判断谁是leader, 只要获取不到lease, 那么就创建lease，成为leader
+
+Q: 另外一个master 的scheduler是在什么情况下怎么获取leader的
+这是在已经有lease的情况下，并且leader不是自己的情况下的问题， 这个时候会等待并且观察时间戳，等租约到期，就开始更换leader了，更新成功即可
+
+
+Q: why use lease instead of endpoint
+still checking
+
+Q: 为什么只有一个master node的时候，也要默认开启leader
+这是因为，就算不考虑多个Master的情况下，我们本来也要支持类似deployment rolling upgrade的场景。
+当我们更新scheduler, 并且部署方式是deployment, upgrade过程中会出现2个 pod的，因此默认会开启leader
+
+# summary
+Kubernetes 中的leader 选举过程很简单。它从创建一个锁对象开始，leader定期更新当前时间戳，以此作为通知其他副本其领导地位的一种方式。这个锁对象可以是 Lease 、 ConfigMap 或 Endpoint ，也持有当前领导者的身份。如果领导者未能在给定的时间间隔内更新时间戳，则认为它已经崩溃，这是当不活动的副本通过使用其身份更新锁来竞相获得领导权时。成功获取锁的 pod 将成为新的领导者。
