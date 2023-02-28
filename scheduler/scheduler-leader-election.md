@@ -6,12 +6,12 @@ scheduler这个组件是有leader选举的，并且是不使用etcd来实现lead
 # background & introduction
 近年来，随着对可靠系统和基础设施的需求增加，“高可用性”一词越来越受欢迎。在分布式系统中，高可用性通常涉及最大化正常运行时间和使系统容错。高可用性中常见的做法是使用冗余来最大程度地减少单点故障。为冗余准备您的系统和服务可能就像在负载均衡器后面**部署更多副本**一样简单。尽管这样的配置适用于许多应用程序，但某些用例需要在副本之间进行**协调**才能使系统正常工作。
 
-一个很好的例子是将 Kubernetes scheduler /  controller mgmt 部署为多个实例。为了防止任何意外行为，leader选举过程必须确保在副本中选出一名领导者，并且是唯一主动协调集群的人。其他实例应保持不活动状态，但准备好在领导实例发生故障时接管。
+一个很好的例子是将 Kubernetes scheduler /  controller mgmt 部署为多个实例。为了防止任何意外行为，leader选举过程必须确保在副本中选出一名领导者，并且是唯一主动协调集群的人。其他实例应保持不活动状态，但准备好在leader 发生故障时接管。
 
 
 # 探索&&问题
 之前使用kubespray provision了一个ha cluster, 是2个node 来作为master node, 3个worker node。 
-我一直以为两个master node的scheduler 是独立运行，没有哪个为leader的时候，我看了一下scheduler pod的日志，大概如下所示
+我一直以为两个master node的scheduler 是独立运行，看了一下scheduler pod的日志，大概如下所示
 ```
 [instance.go:274] Using reconciler: lease
 [lease.go:235] Resetting endpoints for master service "kubernetes" to 10.xx.xx.xx
@@ -31,13 +31,13 @@ metadata:
   labels:
     k8s.io/component: kube-scheduler
     kubernetes.io/hostname: kind-control-plane
-  name: kube-scheduler-c4vwjftbvpc5os2vvzle4qg27a
+  name: kube-scheduler
   namespace: kube-system
   resourceVersion: "18171"
   uid: d6c68901-4ec5-4385-b1ef-2d783738da6c
 spec:
   Acquire Time: 2022-11-30T18:04:27.912073Z
-  holderIdentity: kube-scheduler-c4vwjftbvpc5os2vvzle4qg27a_9cbf54e5-1136-44bd-8f9a-1dcd15c346b4
+  holderIdentity: node2-xxx-xxx
   leaseDurationSeconds: 3600
   lease transitions: 1
   renewTime: "2022-11-30T18:14:27.912073Z"
@@ -107,7 +107,7 @@ type LeaderElectionRecord struct {
 	// all callers may acquire. Versions of this library prior to Kubernetes 1.14 will not
 	// attempt to acquire leases with empty identities and will wait for the full lease
 	// interval to expire before attempting to reacquire. This value is set to empty when
-	// a client voluntarily steps down.
+	// a client voluntarily steps down. 他的注释已经足够清晰了，我就不翻译了
 	HolderIdentity       string      `json:"holderIdentity"`
 	LeaseDurationSeconds int         `json:"leaseDurationSeconds"`
     // Leader 第一次成功获得租约时的时间戳
@@ -143,7 +143,7 @@ type Interface interface {
 }
 ```
 
-以 LeaseResourceLock 的选举过程为例：
+以 `LeaseResourceLock` 的选举过程为例：
 ```go
 func (ll *LeaseLock) Create(ctx context.Context, ler LeaderElectionRecord) error {
 	var err error
@@ -190,7 +190,7 @@ func (ll *LeaseLock) Update(ctx context.Context, ler LeaderElectionRecord) error
 
 ### scheduler Run 
 位置 https://github.com/kubernetes/kubernetes/blob/release-1.25/cmd/kube-scheduler/app/server.go#L146
-首先scheduler 在通过启动参数，构建了cc这个对象，如果启动了leader election, 他就开始进入构建 leaderElector对象，并且通过`leaderElector.Run(ctx)` 来开始进入选举
+首先scheduler 在通过启动参数，构建了cc这个对象，如果启动了leader election, 他就开始进入构建 leaderElector对象，并且通过`leaderElector.Run(ctx)` 来开始进入选举， 也就是说**scheduler 在启动时就会发起选主**
 此方法负责运行领导者选举循环。它首先尝试获取锁（使用 le.acquire）。成功后，它会运行我们之前配置的 OnStartedLeading 回调并定期更新租约。如果获取锁失败，它只会运行 OnStoppedLeading 回调并返回。
 
 ```go
@@ -375,7 +375,11 @@ Q: 另外一个master 的scheduler是在什么情况下怎么获取leader的
 
 
 Q: why use lease instead of endpoint
-still checking
+在代码的注释有提到这一块 https://github.com/kubernetes/kubernetes/blob/release-1.26/staging/src/k8s.io/client-go/tools/leaderelection/resourcelock/interface.go#L37
+在使用 EndpointsLeasesResourceLock 时，需要保证API Priority & Fairness 配置了非默认的流程模式，这将捕获与领导者选举相关的必要操作
+endpoint对象。
+cm 和 ep 的实现高负载下表现不保证，所以还是默认使用lease。
+
 
 Q: 为什么只有一个master node的时候，也要默认开启leader
 这是因为，就算不考虑多个Master的情况下，我们本来也要支持类似deployment rolling upgrade的场景。
