@@ -43,9 +43,6 @@ spec:
   renewTime: "2022-11-30T18:14:27.912073Z"
 ```
 
-粗略的把以前看的时候的图上传上来了，如下所示
-![](./images/ep-leader-algorithm.png)
-
 那就让我们继续带着问题出发，我们的问题分别是：
 1. ha cluster, 另外一个master 的scheduler是在什么情况下怎么获取leader的
 2. why use lease instead of endpoint
@@ -250,7 +247,7 @@ acquire 和 renew 方法实现中最重要的部分是对 tryAcquireOrRenew 的�
         * 更新失败，函数返回 false
         * 更新成功，函数返回 true
 * 函数返回 True 说明本 goroutine 已成功抢占到锁，获得租约合同，成为 leader。
-
+![](./images/scheduler-leader-elec.png)
 
 ```go
 // Run starts the leader election loop. Run will not return
