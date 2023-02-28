@@ -98,6 +98,8 @@ func NewOptions() *Options {
 
 # 原理
 ## 锁结构
+![](./images/aquire-lock.png)
+
 ```go
 type LeaderElectionRecord struct {
 	// HolderIdentity is the ID that owns the lease. If empty, no one owns this lease and
@@ -247,6 +249,8 @@ acquire 和 renew 方法实现中最重要的部分是对 tryAcquireOrRenew 的�
         * 更新失败，函数返回 false
         * 更新成功，函数返回 true
 * 函数返回 True 说明本 goroutine 已成功抢占到锁，获得租约合同，成为 leader。
+
+
 ![](./images/scheduler-leader-elec.png)
 
 ```go
@@ -365,21 +369,25 @@ func (le *LeaderElector) tryAcquireOrRenew(ctx context.Context) bool {
 
 # 解答我们的问题
 Q:  一开始怎么判断谁是leader
-一开始，不需要判断谁是leader, 只要获取不到lease, 那么就创建lease，成为leader
+
+A: 不需要判断谁是leader, 每个scheduler 启动都是只要获取不到lease, 那么就创建lease，成为leader
 
 Q: 另外一个master 的scheduler是在什么情况下怎么获取leader的
-这是在已经有lease的情况下，并且leader不是自己的情况下的问题， 这个时候会等待并且观察时间戳，等租约到期，就开始更换leader了，更新成功即可
+
+A: 这是在已经有lease的情况下，并且leader不是自己的情况下的问题， 这个时候会等待并且观察时间戳，等租约到期，就开始更换leader了，更新成功即可
 
 
 Q: why use lease instead of endpoint
-在代码的注释有提到这一块 https://github.com/kubernetes/kubernetes/blob/release-1.26/staging/src/k8s.io/client-go/tools/leaderelection/resourcelock/interface.go#L37
+
+A: 在代码的注释有提到这一块 https://github.com/kubernetes/kubernetes/blob/release-1.26/staging/src/k8s.io/client-go/tools/leaderelection/resourcelock/interface.go#L37
 在使用 EndpointsLeasesResourceLock 时，需要保证API Priority & Fairness 配置了非默认的流程模式，这将捕获与领导者选举相关的必要操作
 endpoint对象。
 cm 和 ep 的实现高负载下表现不保证，所以还是默认使用lease。
 
 
 Q: 为什么只有一个master node的时候，也要默认开启leader
-这是因为，就算不考虑多个Master的情况下，我们本来也要支持类似deployment rolling upgrade的场景。
+
+A: 这是因为，就算不考虑多个Master的情况下，我们本来也要支持类似deployment rolling upgrade的场景。
 当我们更新scheduler, 并且部署方式是deployment, upgrade过程中会出现2个 pod的，因此默认会开启leader
 
 # summary
