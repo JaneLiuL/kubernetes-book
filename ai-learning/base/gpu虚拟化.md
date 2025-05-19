@@ -40,19 +40,21 @@ Compute Unified Device Architecture (CUDA) 是由 NVIDIA 开发的并行计算�
 
 ## 常见问题
 MIG的使能可能会遇到一些问题，会有pending的错误提示：
-
+```
 $ sudo nvidia-smi -i 0 -mig 1
 Warning: MIG mode is in pending enable state for GPU 00000000:00:03.0:Not Supported
 Reboot the system or try nvidia-smi --gpu-reset to make MIG mode effective on GPU 00000000:00:03.0
 All done.
+```
 可能的原因：
 
 GPU正在被某些程序使用；
 docker容器挂载了这个GPU；
 某些server（比如nvsm dcgm）占用了GPU；
 解决方案：
-
+```bash
 # nvidia-smi --gpu-reset
 # systemctl stop nvsm
 # systemctl stop dcgm
 # docker stop [container] # 停止运行的容器
+```
