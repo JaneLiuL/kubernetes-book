@@ -27,8 +27,11 @@ tiers:
 
 (OpenSession) --> (enqueue) --> (allocate) --> (backfill) --> (CloseSession)
 
-所有的插件注册都是通过执行`OpenSession` 来被call
-下面我们以gang 这个插件来讲一下
+
 scheduler首先加载配置文件loadSchedulerConf，从配置文件读取actions以及plugins，这个第一次读取配置文件之后会不断的watch这个配置文件是否有modify/create来update,接下来启动scheduler初始化所需要的informer
 定时默认每秒钟去执行每个schduler cycle: `runOnce`
 `runOnce`主要是
+所有的插件注册都是通过执行`OpenSession` 来被call，
+
+`predicate`插件
+`gang`插件
