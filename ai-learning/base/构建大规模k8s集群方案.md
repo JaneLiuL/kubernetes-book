@@ -20,6 +20,30 @@
 基于上面的问题，我们做了以下的调整：
 # kube-proxy
 必须使用ipvs 模式
+kube-proxy 更改配置如下
+```yaml
+--ipvs-min-sync-period=1s #默认：最小刷新间隔1s
+--ipvs-sync-period=5s  # 默认：5s周期性刷新
+--cleanup=false
+--ipvs-min-sync-period=0s # 发生事件实时刷新
+--ipvs-sync-period=30s # 30s周期性刷新, 刷新一次节点 iptables 规则
+--cleanup=true (清理 iptables 和 ipvs 规则并退出)
+```
+对于数据面高并发场景，服务服务配置
+```yaml
+--ipvs-scheduler=lc #最小连接，默认是rr round-robi
+```
+
+## conntracker设置
+无论是iptable 或者 ipvs 底层都会走conntracker
+```bash
+$ sysctl -w net.netfilter.nf_conntrack_max=2310720
+```
+kube-proxy 启动的时候会重新设置, 因此配置参数可以按node CPU 个数进行调整
+```bash
+--conntrack-max-per-core=144420  # 2310720/cpu个数。 2310720/16核 = 144420
+--conntrack-min=2310720 # 设置为nf_conntrack_max
+```
 
 # kubelet
 配置每个node的pod的上限
@@ -27,6 +51,52 @@
 --max-pods=500
 --node-status-update-frequency=3s
 ```
+node lease信息上报调优 (update /etc/kubernetes/kubelet-config.yaml)
+```yaml
+  --node-status-update-frequency=3s #Node状态上报周期。默认10s --node-status-update-frequency - Specifies how often kubelet posts its node status to the API server. 可以参考 https://kubernetes.io/docs/concepts/architecture/nodes/
+  --kube-api-qps=50 #node lease信息上报qps
+  --kube-api-burst=100 #node lease信息上报并发
+  --event-qps=100 #pod event信息上报 qps
+  --event-burst=100 #pod event信息上报并发
+```
+集群中Node数据越少， kubelet的event/api qps与burst数越大，单机器上的产生的event数和apiserver交互的请求数就越大；
+集群数据Node数据越大， apiserver和etcd的个数也需要相应按比例增加
+**初略计算方式: qps值 = apiserver的qps数 / node个数**
+
+## kubelet 测试
+测试 kubelet部署Pod速度 和 kubelet 缩容后 event上报速度 两个关键指标
+kubelet部署Pod速度
+亲和到单机，pod 1个数 扩容到 200个， 用时 78,123s 下降到了 24.769s
+```bash
+$ time kubectl rollout status deployment/nginx-deployment
+Waiting for deployment "nginx-deployment" rollout to finish: 1 of 200 updated replicas are available...
+Waiting for deployment "nginx-deployment" rollout to finish: 2 of 200 updated replicas are available...
+Waiting for deployment "nginx-deployment" rollout to finish: 3 of 200 updated replicas are available...
+Waiting for deployment "nginx-deployment" rollout to finish: 4 of 200 updated replicas are available...
+...
+Waiting for deployment "nginx-deployment" rollout to finish: 197 of 200 updated replicas are available...
+Waiting for deployment "nginx-deployment" rollout to finish: 198 of 200 updated replicas are available...
+Waiting for deployment "nginx-deployment" rollout to finish: 199 of 200 updated replicas are available...
+deployment "nginx-deployment" successfully rolled out
+
+real    0m24.769s
+user    0m0.075s
+sys     0m0.012s
+```
+kubelet 缩容 event上报速度
+亲和到单机，pod 200个数 缩容到 1个， 释放 199 个pod 时间， 从 32s 下降到 9.05s
+```bash
+$  watch time kubectl get rs  
+Every 2.0s: time kubectl get rs                                                                                       Thu Sep 15 15:16:33 2022
+
+NAME                         DESIRED   CURRENT   READY   AGE
+nginx-deployment-b56784d9b   1         1         1       28h
+
+real    0m9.058s
+user    0m0.058s
+sys     0m0.015s
+```
+
 # kube-controller-manager
 配置调优
 ```yaml
@@ -97,6 +167,32 @@ apiserver events拆解：
   --etcd-servers-overrides="coordination.k8s.io/leases#http://etcd7:2379,http://etcd8:2379,http://etcd9:2379"
   --etcd-servers-overrides="/pods#http://etcd10:2379,http://etcd11:2379,http://etcd12:2379"
 ```
+
+## etcd性能测试
+kubemark 来模拟k8s计算节点，我们mock 1000个Node, 部署5K个Pod
+写入测试, 写入etcd 数据1.5个G
+```bash
+// leader
+$ benchmark --endpoints="http://10.179.0.13:2379" --target-leader --conns=1 --clients=1 put --key-size=8 --sequential-keys --total=10000 --val-size=256
+
+$ benchmark --endpoints="http://10.179.0.13:2379" --target-leader --conns=100 --clients=1000 put --key-size=8 --sequential-keys --total=100000 --val-size=256
+
+// 所有 members
+$ benchmark --endpoints="http://10.179.0.13:2379,http://10.179.0.2:2379,http://10.179.0.6:2379" --target-leader --conns=1 --clients=1 put --key-size=8 --sequential-keys --total=10000 --val-size=256
+
+$ benchmark --endpoints=""http://10.179.0.13:2379,http://10.179.0.2:2379,http://10.179.0.6:2379"  --target-leader --conns=100 --clients=1000 put --key-size=8 --sequential-keys --total=100000 --val-size=256
+```
+读取测试
+```bash
+$ benchmark --endpoints="http://10.179.0.13:2379,http://10.179.0.2:2379,http://10.179.0.6:2379"  --conns=1 --clients=1  range foo --consistency=l --total=10000
+
+$ benchmark --endpoints="http://10.179.0.13:2379,http://10.179.0.2:2379,http://10.179.0.6:2379"  --conns=1 --clients=1  range foo --consistency=s --total=10000
+
+$ benchmark --endpoints="http://10.179.0.13:2379,http://10.179.0.2:2379,http://10.179.0.6:2379"  --conns=100 --clients=1000  range foo --consistency=l --total=100000
+
+$ benchmark --endpoints="http://10.179.0.13:2379,http://10.179.0.2:2379,http://10.179.0.6:2379"  --conns=100 --clients=1000  range foo --consistency=s --total=100000
+```
+
 
 # apiserver优化
 生产环境中，kubelet每10s汇报一次心跳，心跳的内容15Kb, 会容易引起etcd 中Node对象更新的时候产生每分钟将近300多M的transaction logs
