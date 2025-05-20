@@ -18,6 +18,16 @@
     * fail restart slowly
 
 基于上面的问题，我们做了以下的调整：
+# 架构设计和优化
+架构设计需要从网络设计，存储架构设计等方面都要入手，这个具体看业务以及能拿到的硬件资源等，可以整体从以下几个方面考虑
+节点部署：	 多节点、地理分布、硬件高性能配置
+存储：   	 NVMe SSD、优化文件系统、启用压缩
+参数调优：	 快照频率、Wal存放、资源限制
+网络：  	高速专用网络、TLS安全通信
+监控：  	关键指标实时监控，及时调优
+安全：  	TLS、权限控制、备份策略
+
+
 # kube-proxy
 必须使用ipvs 模式
 kube-proxy 更改配置如下
@@ -195,6 +205,11 @@ $ benchmark --endpoints="http://10.179.0.13:2379,http://10.179.0.2:2379,http://1
 
 
 # apiserver优化
-生产环境中，kubelet每10s汇报一次心跳，心跳的内容15Kb, 会容易引起etcd 中Node对象更新的时候产生每分钟将近300多M的transaction logs
-并且apiserver会有很高的cpu消耗
-# 网络设计和优化
+
+
+
+
+# 整体测试
+使用45台机器 kubermark 在kubermark namespace下 mock 出来5000个 node
+使用e2e工具 创建出来50个namespace， 1000个service， 40000个pod。
+其中中1/4的namespace是大规模1000+ pod，1/4是中型规模400+ pod； 1/2的namespace是小型50+ pod； 按 namespace下的 configmap、serviceaccount、secrets等，按pod的个数等4：1比例随机创建
