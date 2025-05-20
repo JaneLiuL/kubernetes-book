@@ -9,10 +9,10 @@ session就是调度周期，默认1秒，每个调度周期都会new一个sessio
 go wait.Until(pc.runOnce, pc.schedulePeriod, stopCh)
 ```
 在`runOnce`里面我们可以看到他会读取配置并且把plugin初始化，然后调用插件的`plugin.OnSessionOpen(ssn)`, 插件在`OnSessionOpen`中初始化所需要的数据，并且将回调函数注册到session中，插件注册的函数常用的有：
-注意Plugin不需要注册下面所有的函数，而是可以根据自己的需要，注册某几个函数。
-比如Predict plugin就只注册了`ssn.AddPredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) error {` 这个AddPredicateFn函数到Session中
-比如说Gang plugin就注册了`ssn.AddJobValidFn(gp.Name(), validJobFn)`  注册了jobvalid 函数
 
+* Predict plugin就只注册了`ssn.AddPredicateFn(pp.Name(), func(task *api.TaskInfo, node *api.NodeInfo) error {` 这个AddPredicateFn函数到Session中
+* Gang plugin就注册了`ssn.AddJobValidFn(gp.Name(), validJobFn)`  注册了jobvalid 函数
+注意Plugin不需要注册下面所有的函数，而是可以根据自己的需要，注册某几个函数。
 ![](../images/volcano-scheduler-registerfn.png)
 
 初始化成功之后，volcano会依次调用不同action的Execute方法
@@ -66,7 +66,10 @@ func (sc *SchedulerCache) nodeCanAddCache(node *v1.Node) bool {
 
 ```
 # actions
-
+## enqueue
+## allocate
+## preempt
+## backfill
 
 # 插件
 插件主要实现了3个函数：Name， OnSessionOpen， OnSessionClose
