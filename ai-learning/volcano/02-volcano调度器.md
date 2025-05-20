@@ -66,9 +66,19 @@ func (sc *SchedulerCache) nodeCanAddCache(node *v1.Node) bool {
 
 ```
 # actions
+以下是vocano的一些action,我没有把所有action 都拿出来讲，只拿
+![](../images/volcano-scheduler-actions.png)
+![](../images/volcano-scheduler-actions-start.png)
+
 ## enqueue
+
+
 ## allocate
+
+
 ## preempt
+
+
 ## backfill
 
 # 插件
