@@ -114,5 +114,40 @@ scheduler首先加载配置文件loadSchedulerConf，从配置文件读取action
 `runOnce`主要是
 所有的插件注册都是通过执行`OpenSession` 来被call，
 ## `gang`插件
+gang调度是满足all or nothing的调度，
+![](../images/volcano-scheduler-gang01.png)
+它首先通过 AddJobValidFn，AddJobOrderFn，AddJobReadyFn，AddJobPipelinedFn，AddJobStarvingFns注册了jobValidFns JobOrderFn等函数
+
+在`AddJobValidFn`里面主要是判断`job.ValidTaskNum()` 是否小于 `job.MinAvailable`,说人话就是判断job下面的pod处于以下`Bound, Binding, Running, Allocated， Succeeded， Pipelined Pending`状态的数量总数是否少于job的`MinAvailable`，gang调度会认为以上的状态的pod是有更高的优先级。写得挺好的，如果加点测试代码更好了哈哈
+```go
+func (ji *JobInfo) CheckTaskValid() bool {
+	// if job minAvailable is less than sum of(task minAvailable), skip this check
+	if ji.MinAvailable < ji.TaskMinAvailableTotal {
+		return true
+	}
+
+	actual := map[string]int32{}
+	for status, tasks := range ji.TaskStatusIndex {
+		if AllocatedStatus(status) ||
+			status == Succeeded ||
+			status == Pipelined ||
+			status == Pending {
+			for _, task := range tasks {
+				actual[task.TaskRole]++
+			}
+		}
+	}
+  for task, minAvailable := range ji.TaskMinAvailable {
+		if minAvailable == 0 {
+			continue
+		}
+		if act, ok := actual[task]; !ok || act < minAvailable {
+			return false
+		}
+	}
+
+	return true
+```
+然后接下来我们可以看看
 
 ## `predicate`插件
