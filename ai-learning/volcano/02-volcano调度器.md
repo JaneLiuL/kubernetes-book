@@ -113,6 +113,6 @@ scheduler首先加载配置文件loadSchedulerConf，从配置文件读取action
 定时默认每秒钟去执行每个schduler cycle: `runOnce`
 `runOnce`主要是
 所有的插件注册都是通过执行`OpenSession` 来被call，
+## `gang`插件
 
-`predicate`插件
-`gang`插件
+## `predicate`插件

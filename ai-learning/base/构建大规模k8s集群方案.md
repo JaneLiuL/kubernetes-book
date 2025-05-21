@@ -46,7 +46,7 @@ kube-proxy 更改配置如下
 ```
 
 ## conntracker设置
-无论是iptable 或者 ipvs 底层都会走conntracker
+无论是iptable 或者 ipvs ，底层都会走conntracker
 ```bash
 $ sysctl -w net.netfilter.nf_conntrack_max=2310720
 ```
@@ -57,7 +57,7 @@ kube-proxy 启动的时候会重新设置, 因此配置参数可以按node CPU �
 ```
 
 # kubelet
-配置每个node的pod的上限
+首先配置每个node的pod的上限，默认应该是100的，如果我们要上万个pod那是肯定要修改的
 ```yaml
 --max-pods=500
 --node-status-update-frequency=3s
@@ -77,35 +77,18 @@ node lease信息上报调优 (update /etc/kubernetes/kubelet-config.yaml)
 ## kubelet 测试
 测试 kubelet部署Pod速度 和 kubelet 缩容后 event上报速度 两个关键指标
 kubelet部署Pod速度
-亲和到单机，pod 1个数 扩容到 200个， 用时 78,123s 下降到了 24.769s
+使用亲和性到单机，pod 1个数 扩容到 200个， 
 ```bash
-$ time kubectl rollout status deployment/nginx-deployment
-Waiting for deployment "nginx-deployment" rollout to finish: 1 of 200 updated replicas are available...
-Waiting for deployment "nginx-deployment" rollout to finish: 2 of 200 updated replicas are available...
-Waiting for deployment "nginx-deployment" rollout to finish: 3 of 200 updated replicas are available...
-Waiting for deployment "nginx-deployment" rollout to finish: 4 of 200 updated replicas are available...
-...
-Waiting for deployment "nginx-deployment" rollout to finish: 197 of 200 updated replicas are available...
-Waiting for deployment "nginx-deployment" rollout to finish: 198 of 200 updated replicas are available...
-Waiting for deployment "nginx-deployment" rollout to finish: 199 of 200 updated replicas are available...
-deployment "nginx-deployment" successfully rolled out
-
-real    0m24.769s
-user    0m0.075s
-sys     0m0.012s
+$ time kubectl rollout status deployment/demo
 ```
 kubelet 缩容 event上报速度
 亲和到单机，pod 200个数 缩容到 1个， 释放 199 个pod 时间， 从 32s 下降到 9.05s
 ```bash
 $  watch time kubectl get rs  
-Every 2.0s: time kubectl get rs                                                                                       Thu Sep 15 15:16:33 2022
+Every 2.0s: time kubectl get rs                                                                                       Thu 
 
 NAME                         DESIRED   CURRENT   READY   AGE
-nginx-deployment-b56784d9b   1         1         1       28h
-
-real    0m9.058s
-user    0m0.058s
-sys     0m0.015s
+demo-xx   1         1         1       28h
 ```
 
 # kube-controller-manager
@@ -125,8 +108,8 @@ sys     0m0.015s
 ```
 
 # etcd 优化
+建议etcd尽量不要使用容器化部署
 ## 时间参数
-etcd 地产分布式一致性协议是参数来保证节点之间能在部分节点掉线情况下还能处理选举，第一个参数就是所谓的心跳间隔，默认是250毫秒
 这里我们是使用kubespray安装的集群, heartbeat-interval就是所谓的心跳间隔，即主节点通知从节点它还是领导者的频率。实践数据表明，该参数应该设置成节点之间 RTT 的时间, 评估RTT 的最简单的方法是使用ping 操作
 ```yaml
 --heartbeat-interval=250
@@ -134,7 +117,7 @@ etcd 地产分布式一致性协议是参数来保证节点之间能在部分节
 ## 快照
 存储创建快照的代价是很高的，所以只用当参数累积到一定的数量时，Etcd 才会创建快照文件。 默认值是 10000 在超大集群中，Etcd 的内存使用和磁盘使用过高，那么应该尝试调低快照触发的阈值
 ```yaml
-   --snapshot-count=5000 #数量达到 5000 时才会建立快照, 我们现在这个是10000
+   --snapshot-count=10000 #数量达到 10000 时才会建立快照
 ```
 ## 磁盘
 etcd 的存储目录分为 snapshot 和 wal，他们写入的方式是不同的，snapshot 是内存直接 dump file，而 wal 是顺序追加写。因此可以将 snap 与 wal 进行分盘，放在两块 SSD 盘上，提高整体的 IO 效率，这种方式可以提升 etcd 20%左右的性能。
